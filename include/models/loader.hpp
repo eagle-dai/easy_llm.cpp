@@ -1,0 +1,29 @@
+#ifndef EASY_GPT_LOADER_HPP
+#define EASY_GPT_LOADER_HPP
+
+#include <array>
+#include <vector>
+#include <memory>
+#include <unordered_map>
+
+#include "tensor.hpp"
+#include "config.hpp"
+
+namespace easy_gpt {
+
+class ModelParam {
+public:
+    static std::unique_ptr<ModelParam> load(const std::string& model_path);
+    ModelParam();
+    Tensor get_param(const std::string& key);
+    bool contains(const std::string& key) const;
+
+private:
+    void load_from_ckpt(const std::string& path);
+
+    std::unordered_map<std::string, Tensor> params_;
+};
+
+}  // namespace easy_gpt
+
+#endif  // EASY_GPT_LOADER_HPP
