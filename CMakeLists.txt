@@ -6,6 +6,14 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(EASY_GPT_ENABLE_CUDA "Enable CUDA backend" OFF)
+if(EASY_GPT_ENABLE_CUDA)
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    find_package(CUDAToolkit REQUIRED)
+endif()
+
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Choose the type of build." FORCE)
 endif()
@@ -25,13 +33,19 @@ file(GLOB EASY_GPT_CORE_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/spdlog/*.cpp"
 )
 list(REMOVE_ITEM EASY_GPT_CORE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+if(EASY_GPT_ENABLE_CUDA)
+    list(APPEND EASY_GPT_CORE_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/runtime.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/ops/matmul.cu"
+    )
+endif()
 
 add_library(easy_gpt_core STATIC ${EASY_GPT_CORE_SOURCES})
 target_compile_features(easy_gpt_core PUBLIC cxx_std_17)
 target_compile_options(easy_gpt_core PRIVATE
-    ${EASY_GPT_WARNING_FLAGS}
-    $<$<CONFIG:Debug>:-O0 -fno-inline -fno-omit-frame-pointer -ggdb3 -fno-elide-constructors>
-    $<$<CONFIG:Release>:-O3 -march=native>
+    $<$<COMPILE_LANGUAGE:CXX>:${EASY_GPT_WARNING_FLAGS}>
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Debug>>:-O0 -fno-inline -fno-omit-frame-pointer -ggdb3 -fno-elide-constructors>
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:-O3 -march=native>
 )
 
 
@@ -56,6 +70,14 @@ if(EASY_GPT_ENABLE_OPENMP)
 endif()
 
 target_compile_definitions(easy_gpt_core PUBLIC SPDLOG_COMPILED_LIB USE_BF16)
+if(EASY_GPT_ENABLE_CUDA)
+    target_compile_definitions(easy_gpt_core PUBLIC USE_CUDA)
+    target_compile_features(easy_gpt_core PUBLIC cuda_std_17)
+    target_link_libraries(easy_gpt_core PUBLIC CUDA::cudart CUDA::cublas)
+    if(TARGET CUDA::cublasLt)
+        target_link_libraries(easy_gpt_core PUBLIC CUDA::cublasLt)
+    endif()
+endif()
 
 add_executable(easy_gpt src/main.cpp)
 target_link_libraries(easy_gpt PRIVATE easy_gpt_core)

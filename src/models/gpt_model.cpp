@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
+#include <chrono>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -250,6 +251,8 @@ void GptModel::decode(GenerationContext& ctx) {
         throw std::invalid_argument("decode: next_generated_tokens size must match sample_ids size.");
     }
     sampler_->set_params(config_.temperature, config_.top_p, config_.top_k, config_.use_greedy);
+    auto decode_start = std::chrono::steady_clock::now();
+    int decode_steps = 0;
     while (ctx.step < ctx.max_steps && !ctx.sample_ids.empty()) {
         spdlog::info("----------Step {} : remaining batch size {}----------", ctx.step, ctx.sample_ids.size());
         std::vector<std::vector<int>> input_single_token = build_decode_step_tokens(ctx.next_generated_tokens);
@@ -263,6 +266,13 @@ void GptModel::decode(GenerationContext& ctx) {
         }
         ctx.next_generated_tokens = sample_and_record_last_token(ctx, output_info, ctx.step);
         apply_eos_filter_and_update_state(ctx);
+        decode_steps += 1;
+    }
+    if (decode_steps > 0) {
+        auto decode_end = std::chrono::steady_clock::now();
+        double total_ms = std::chrono::duration_cast<std::chrono::microseconds>(decode_end - decode_start).count() / 1000.0;
+        double avg_ms = total_ms / decode_steps;
+        spdlog::info("Decode finished: steps={}, avg_ms_per_step={:.3f}, total_ms={:.3f}", decode_steps, avg_ms, total_ms);
     }
 }
 

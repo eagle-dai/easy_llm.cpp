@@ -7,6 +7,9 @@
 #include "data_manager.hpp"
 #include "tokenizer.hpp"
 #include "tensor.hpp"
+#ifdef USE_CUDA
+    #include "cuda/runtime.hpp"
+#endif
 
 namespace easy_gpt {
 
@@ -21,6 +24,9 @@ GptEngine::GptEngine(unique_ptr<GptModel>&& gpt_model,
     : config_{move(config)},
       data_manager_{move(data_manager)},
       model_{move(gpt_model)} {
+#ifdef USE_CUDA
+    cuda::initialize();
+#endif
     spdlog::info("Gpt Engine created");
 }
 

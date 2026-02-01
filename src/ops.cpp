@@ -5,23 +5,40 @@
 
 #include "spdlog/spdlog.h"
 
+#ifdef USE_CUDA
+    #include "cuda/ops/matmul.hpp"
+    #include "cuda/runtime.hpp"
+#endif
+
 namespace easy_gpt {
 namespace ops {
 
 using std::vector;
 
-Tensor matmul_3d(const Tensor& input, const Tensor& weights) {
-    // spdlog::trace("matmul_3d input shape == {},{}", input.shape()[1], input.shape()[2]);
-    // spdlog::trace("matmul_3d weights_ shape == {},{}", weights.shape()[0], weights.shape()[1]);
+namespace {
+
+struct Matmul3dShape {
+    int batch;
+    int seq_len;
+    int height;
+    int width;
+};
+
+Matmul3dShape validate_matmul_3d_shapes(const Tensor& input, const Tensor& weights) {
     const int height = weights.shape()[0];
-    const int width  = weights.shape()[1];
+    const int width = weights.shape()[1];
     if (input.shape().back() != width) {
         spdlog::error("matmul_3d input.shape().back() == {}, width == {}",
                       input.shape().back(), width);
         throw std::invalid_argument("The last dimension of input must be equal to width.");
     }
-    const int batch   = input.shape()[0];
+    const int batch = input.shape()[0];
     const int seq_len = input.shape()[1];
+    return Matmul3dShape{batch, seq_len, height, width};
+}
+
+Tensor matmul_3d_cpu(const Tensor& input, const Tensor& weights,
+                     int batch, int seq_len, int height, int width) {
     Tensor output(batch * seq_len * height);
 
     // Pre-convert weights -> float (once per call)
@@ -79,6 +96,26 @@ Tensor matmul_3d(const Tensor& input, const Tensor& weights) {
     }
     output.reshape({batch, seq_len, height});
     return output;
+}
+
+} // namespace
+
+Tensor matmul_3d(const Tensor& input, const Tensor& weights) {
+    // spdlog::trace("matmul_3d input shape == {},{}", input.shape()[1], input.shape()[2]);
+    // spdlog::trace("matmul_3d weights_ shape == {},{}", weights.shape()[0], weights.shape()[1]);
+    const auto shape = validate_matmul_3d_shapes(input, weights);
+
+#if defined(USE_CUDA)
+    if (::easy_gpt::cuda::available()) {
+        try {
+            return matmul_3d_cuda(input, weights);
+        } catch (const std::exception& e) {
+            spdlog::error("matmul_3d CUDA failed, falling back to CPU: {}", e.what());
+        }
+    }
+#endif
+
+    return matmul_3d_cpu(input, weights, shape.batch, shape.seq_len, shape.height, shape.width);
 }
 
 Tensor matmul_4d(const Tensor& input, const Tensor& weights) {

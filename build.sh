@@ -1,5 +1,12 @@
 mkdir -p build
 cd build
+
 # cmake -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=g++ ..
-cmake -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=g++ ..
+
+# no cuda
+# cmake -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=g++ ..
+
+# cuda
+cmake -DCMAKE_SYSTEM_NAME=Linux -DEASY_GPT_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=g++ ..
+
 make easy_gpt -j 8
