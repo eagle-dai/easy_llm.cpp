@@ -6,6 +6,10 @@ A minimal C++ framework for learning and understanding the LLM inference pipelin
 
 This project focuses on **architecture and the inference process**, not peak performance: operators are implemented with correctness and readability as the priority. Third-party dependencies are kept minimal (`spdlog` and `nlohmann/json`, both vendored in the repo); everything else is implemented in C++, making it a good baseline for coursework, research prototypes, or personal learning.
 
+## Updates
+- `dev/cuda` (CUDA operator development) has been merged into `release` and is in an early, just-started stage.
+- `release` remains CPU-first by default: `build.sh` does **not** enable CUDA. To build with CUDA, pass `-DEASY_LLM_ENABLE_CUDA=ON` (and CUDA arch) in CMake.
+
 ---
 
 ## Quick Start
