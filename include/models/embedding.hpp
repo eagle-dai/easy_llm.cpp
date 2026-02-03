@@ -1,5 +1,5 @@
-#ifndef EASY_GPT_MODELS_EMBEDDING_HPP
-#define EASY_GPT_MODELS_EMBEDDING_HPP
+#ifndef EASY_LLM_MODELS_EMBEDDING_HPP
+#define EASY_LLM_MODELS_EMBEDDING_HPP
 
 #include <vector>
 #include <memory>
@@ -8,7 +8,7 @@
 #include "tensor.hpp"
 #include "models/loader.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 class Embedding {
 public:
@@ -30,6 +30,6 @@ private:
     const float rope_theta_{10000.0f};
 };
 
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_MODELS_EMBEDDING_HPP
+#endif // EASY_LLM_MODELS_EMBEDDING_HPP

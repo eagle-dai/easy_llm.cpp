@@ -14,7 +14,7 @@
 #include "ops.hpp"
 #include "tensor.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 using std::vector;
 using std::string;
@@ -150,4 +150,4 @@ bool ModelParam::contains(const string& key) const {
     return false;
 }
 
-}  // namespace easy_gpt
+}  // namespace easy_llm

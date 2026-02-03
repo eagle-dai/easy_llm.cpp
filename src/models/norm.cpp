@@ -9,7 +9,7 @@
 #include "tensor.hpp"
 #include "models/loader.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 using std::string;
 
@@ -61,4 +61,4 @@ Tensor RMSNorm::forward(const Tensor& input) const {
     return input_norm;
 }
 
-}  // namespace easy_gpt
+}  // namespace easy_llm

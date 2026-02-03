@@ -1,11 +1,11 @@
-#ifndef EASY_GPT_CUDA_DEVICE_BUFFER_HPP
-#define EASY_GPT_CUDA_DEVICE_BUFFER_HPP
+#ifndef EASY_LLM_CUDA_DEVICE_BUFFER_HPP
+#define EASY_LLM_CUDA_DEVICE_BUFFER_HPP
 
 #include <cstddef>
 
 #include <cuda_runtime.h>
 
-namespace easy_gpt {
+namespace easy_llm {
 namespace cuda {
 
 void cuda_check(cudaError_t status, const char* msg);
@@ -77,6 +77,6 @@ private:
 };
 
 } // namespace cuda
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_CUDA_DEVICE_BUFFER_HPP
+#endif // EASY_LLM_CUDA_DEVICE_BUFFER_HPP

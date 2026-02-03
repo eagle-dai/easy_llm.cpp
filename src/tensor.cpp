@@ -3,7 +3,7 @@
 
 #include "spdlog/spdlog.h"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 using std::move;
 using std::vector;
@@ -260,4 +260,4 @@ Tensor& Tensor::repeat(int repeats, int axis) {
     return *this;
 }
 
-} // namespace easy_gpt
+} // namespace easy_llm

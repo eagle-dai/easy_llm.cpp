@@ -5,7 +5,7 @@
 
 #include "config.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 Block::Block() {
 }
@@ -43,4 +43,4 @@ void Block::set_pad_lens(const std::vector<int>& pad_lens) {
     self_attn_.set_pad_lens(pad_lens);
 }
 
-} // namespace easy_gpt
+} // namespace easy_llm

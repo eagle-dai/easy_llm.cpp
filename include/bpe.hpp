@@ -1,12 +1,12 @@
-#ifndef EASY_GPT_BPE_HPP
-#define EASY_GPT_BPE_HPP
+#ifndef EASY_LLM_BPE_HPP
+#define EASY_LLM_BPE_HPP
 
 #include <vector>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 
-namespace easy_gpt {
+namespace easy_llm {
 
 class Bpe {
 public:
@@ -33,6 +33,6 @@ private:
     std::unordered_map<std::string, unsigned char> byte_decoder_;
     mutable std::unordered_map<std::string, std::string> bpe_cache_;
 };
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_BPE_HPP
+#endif // EASY_LLM_BPE_HPP

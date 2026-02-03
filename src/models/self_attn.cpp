@@ -9,7 +9,7 @@
 
 #include "config.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 namespace {
 
@@ -393,4 +393,4 @@ void SelfAttn::set_pad_lens(const std::vector<int>& pad_lens) {
     pad_lens_by_sample_ = pad_lens;
 }
 
-} // namespace easy_gpt
+} // namespace easy_llm

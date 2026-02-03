@@ -1,5 +1,5 @@
-#ifndef EASY_GPT_CUDA_PRECISION_HPP
-#define EASY_GPT_CUDA_PRECISION_HPP
+#ifndef EASY_LLM_CUDA_PRECISION_HPP
+#define EASY_LLM_CUDA_PRECISION_HPP
 
 #include <cstddef>
 
@@ -10,7 +10,7 @@
 #include "precision.hpp"
 #include "tensor.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 namespace cuda {
 
 template <typename T>
@@ -54,6 +54,6 @@ struct CudaPrecisionTraits<Bf16> {
 };
 
 } // namespace cuda
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_CUDA_PRECISION_HPP
+#endif // EASY_LLM_CUDA_PRECISION_HPP

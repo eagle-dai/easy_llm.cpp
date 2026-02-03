@@ -1,5 +1,5 @@
-#ifndef EASY_GPT_UTILS_HPP
-#define EASY_GPT_UTILS_HPP
+#ifndef EASY_LLM_UTILS_HPP
+#define EASY_LLM_UTILS_HPP
 
 #include <string>
 #include <vector>
@@ -11,7 +11,7 @@
 
 #include "json.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 extern std::mt19937 gen;
 extern std::uniform_real_distribution<> dis;
@@ -28,6 +28,6 @@ std::vector<char> read_bytes(std::ifstream& file, size_t num_bytes);
 
 }
 
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_UTILS_HPP
+#endif // EASY_LLM_UTILS_HPP

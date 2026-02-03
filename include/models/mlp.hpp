@@ -1,5 +1,5 @@
-#ifndef EASY_GPT_MODELS_MLP_HPP
-#define EASY_GPT_MODELS_MLP_HPP
+#ifndef EASY_LLM_MODELS_MLP_HPP
+#define EASY_LLM_MODELS_MLP_HPP
 
 #include <vector>
 #include <memory>
@@ -10,7 +10,7 @@
 #include "models/linear.hpp"
 #include "models/norm.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 class MLP {
 public:
@@ -28,6 +28,6 @@ private:
     RMSNorm norm_{};
 };
 
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_MODELS_MLP_HPP
+#endif // EASY_LLM_MODELS_MLP_HPP

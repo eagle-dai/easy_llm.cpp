@@ -1,5 +1,5 @@
-#ifndef EASY_GPT_MODELS_LINEAR_HPP
-#define EASY_GPT_MODELS_LINEAR_HPP
+#ifndef EASY_LLM_MODELS_LINEAR_HPP
+#define EASY_LLM_MODELS_LINEAR_HPP
 
 #include <vector>
 #include <memory>
@@ -8,7 +8,7 @@
 #include "tensor.hpp"
 #include "models/loader.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 class Linear {
 public:
@@ -26,6 +26,6 @@ private:
     int in_dim_;
 };
 
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_MODELS_LINEAR_HPP
+#endif // EASY_LLM_MODELS_LINEAR_HPP

@@ -1,11 +1,11 @@
-#ifndef EASY_GPT_TENSOR_HPP
-#define EASY_GPT_TENSOR_HPP
+#ifndef EASY_LLM_TENSOR_HPP
+#define EASY_LLM_TENSOR_HPP
 
 #include <vector>
 
 #include "bf16.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 #ifdef USE_FP32
     using data_type = float;
@@ -60,6 +60,6 @@ private:
 };
 
 
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_TENSOR_HPP
+#endif // EASY_LLM_TENSOR_HPP

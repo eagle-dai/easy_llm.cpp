@@ -1,6 +1,6 @@
 [English](README.md) | 简体中文
 
-# easy_gpt
+# easy_llm
 
 一个用于学习与理解大模型推理流程的微型 C++ 框架。项目以“可读、可学、可改”为目标，尽量保留推理全链路的关键步骤（配置加载、权重加载、Tokenizer、Prefill/Decode、采样与解码），便于读者按模块逐层拆解与理解。当前默认适配 **Qwen2.5-0.5B**，可在单机环境中快速跑通端到端推理流程。
 
@@ -34,9 +34,9 @@ data/model/
 
 ### 运行示例
 ```bash
-./build/easy_gpt --help
-./build/easy_gpt --max-steps 128 --temperature 0.7 --top-p 0.9 --top-k 40 "Hello"
-./build/easy_gpt --max-steps 256 --temperature 0.1 -f test/data/test_batch.txt
+./build/easy_llm --help
+./build/easy_llm --max-steps 128 --temperature 0.7 --top-p 0.9 --top-k 40 "Hello"
+./build/easy_llm --max-steps 256 --temperature 0.1 -f test/data/test_batch.txt
 ```
 
 主要参数说明：  
@@ -92,7 +92,7 @@ data/                # 模型权重与 tokenizer 资源（git 忽略）
 
 - **模型与 tokenizer 路径**：位于 `include/config.hpp`，默认指向 `data/model/` 下的文件。
 - **精度选择**：默认编译为 BF16（`USE_BF16`），如需切换 FP16/FP32 可在编译选项中调整宏定义。
-- **OpenMP**：默认开启（`EASY_GPT_ENABLE_OPENMP=ON`），可通过 CMake 选项关闭或自行安装运行时。
+- **OpenMP**：默认开启（`EASY_LLM_ENABLE_OPENMP=ON`），可通过 CMake 选项关闭或自行安装运行时。
 - **模型适配**：当前针对 Qwen2.5-0.5B 的权重命名与配置进行适配，切换其他模型需确保 `config.json`、权重 key 与 tokenizer 兼容。
 
 ---

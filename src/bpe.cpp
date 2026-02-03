@@ -12,7 +12,7 @@
 #include "utils.hpp"
 #include "spdlog/spdlog.h"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 using std::string;
 using std::vector;
@@ -194,4 +194,4 @@ void Bpe::init_byte_encoder() {
     }
 }
 
-} // namespace easy_gpt
+} // namespace easy_llm

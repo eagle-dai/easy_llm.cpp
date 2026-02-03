@@ -1,5 +1,5 @@
-#ifndef EASY_GPT_TOKENIZER_HPP
-#define EASY_GPT_TOKENIZER_HPP
+#ifndef EASY_LLM_TOKENIZER_HPP
+#define EASY_LLM_TOKENIZER_HPP
 
 #include <vector>
 #include <string>
@@ -10,7 +10,7 @@
 #include "json.hpp"
 #include "bpe.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 struct Config;
 
@@ -51,6 +51,6 @@ private:
     int bos_token_id_{-1};
 };
 
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_TOKENIZER_HPP
+#endif // EASY_LLM_TOKENIZER_HPP

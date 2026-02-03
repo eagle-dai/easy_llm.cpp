@@ -1,6 +1,6 @@
 English | [简体中文](README.zh-CN.md)
 
-# easy_gpt
+# easy_llm
 
 A minimal C++ framework for learning and understanding the LLM inference pipeline. The project aims to be readable, easy to learn, and easy to modify, while preserving the key steps of a full inference flow (config loading, weight loading, tokenizer, prefill/decode, sampling and decoding). The default setup targets **Qwen2.5-0.5B**, so you can quickly run end-to-end inference on a single machine.
 
@@ -34,9 +34,9 @@ To customize paths, edit the default configuration in `include/config.hpp`.
 
 ### Run Examples
 ```bash
-./build/easy_gpt --help
-./build/easy_gpt --max-steps 128 --temperature 0.7 --top-p 0.9 --top-k 40 "Hello"
-./build/easy_gpt --max-steps 256 --temperature 0.1 -f test/data/test_batch.txt
+./build/easy_llm --help
+./build/easy_llm --max-steps 128 --temperature 0.7 --top-p 0.9 --top-k 40 "Hello"
+./build/easy_llm --max-steps 256 --temperature 0.1 -f test/data/test_batch.txt
 ```
 
 Key arguments:
@@ -92,7 +92,7 @@ data/                # Model weights and tokenizer assets (git-ignored)
 
 - **Model/tokenizer paths**: in `include/config.hpp`, defaulting to files under `data/model/`.
 - **Precision**: default build uses BF16 (`USE_BF16`). Switch to FP16/FP32 by adjusting compile-time macro definitions.
-- **OpenMP**: enabled by default (`EASY_GPT_ENABLE_OPENMP=ON`); you can disable it via CMake options or install an OpenMP runtime.
+- **OpenMP**: enabled by default (`EASY_LLM_ENABLE_OPENMP=ON`); you can disable it via CMake options or install an OpenMP runtime.
 - **Model adaptation**: currently adapted to Qwen2.5-0.5B (weight key naming and config). To switch models, ensure `config.json`, weight keys, and tokenizer assets are compatible.
 
 ---

@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace easy_gpt {
+namespace easy_llm {
 
 namespace {
 
@@ -112,4 +112,4 @@ void TopKTopPSampler::set_params(float temperature, float top_p, int top_k, bool
     use_greedy_ = use_greedy;
 }
 
-}  // namespace easy_gpt
+}  // namespace easy_llm

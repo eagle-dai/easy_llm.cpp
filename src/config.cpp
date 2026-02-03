@@ -4,7 +4,7 @@
 
 #include "utils.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 void Config::load_config() {
     auto json_data = utils::load_json(model_config_path);
@@ -37,4 +37,4 @@ void Config::load_config() {
     );
 }
 
-} // namespace easy_gpt
+} // namespace easy_llm

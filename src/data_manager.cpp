@@ -13,7 +13,7 @@
 #include "tokenizer.hpp"
 #include "utils.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 using std::string;
 using std::vector;
@@ -205,4 +205,4 @@ void DataManager::apply_padding(vector<vector<int>>& batch, int max_len) {
     }
 }
 
-} // namespace easy_gpt
+} // namespace easy_llm

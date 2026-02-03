@@ -1,12 +1,12 @@
-#ifndef EASY_GPT_BF16_HPP
-#define EASY_GPT_BF16_HPP
+#ifndef EASY_LLM_BF16_HPP
+#define EASY_LLM_BF16_HPP
 
 #include <cstdint>
 #include <cstring>
 
 #include <spdlog/fmt/bundled/format.h>
 
-namespace easy_gpt {
+namespace easy_llm {
 
 inline float bf16_to_float(uint16_t bf16) {
     uint32_t bits = static_cast<uint32_t>(bf16) << 16;
@@ -119,18 +119,18 @@ struct Bf16 {
         return old;
     }
 };
-}  // namespace easy_gpt
+}  // namespace easy_llm
 
 namespace fmt {
     template <>
-    struct formatter<easy_gpt::Bf16> {
+    struct formatter<easy_llm::Bf16> {
       template <typename ParseContext>
       constexpr auto parse(ParseContext& ctx) { return ctx.begin(); }
       template <typename FormatContext>
-      auto format(const easy_gpt::Bf16& value, FormatContext& ctx) {
+      auto format(const easy_llm::Bf16& value, FormatContext& ctx) {
         return format_to(ctx.out(), "{}", static_cast<float>(value));
       }
     };
 } // namespace fmt
 
-#endif // EASY_GPT_BF16_HPP
+#endif // EASY_LLM_BF16_HPP

@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-namespace easy_gpt {
+namespace easy_llm {
 namespace {
 
 std::string trim(const std::string& text) {
@@ -21,7 +21,7 @@ std::string trim(const std::string& text) {
 }  // namespace
 
 void print_usage(std::ostream& os) {
-    os << "Usage: easy_gpt [--prompt-file <path>] [--max-steps <n>]\n"
+    os << "Usage: easy_llm [--prompt-file <path>] [--max-steps <n>]\n"
           "                [--temperature <float>] [--top-p <float>] [--top-k <int>] [--seed <int>] [--greedy]\n"
           "                [\"prompt\"]\n"
        << "  -f, --prompt-file <path>  Read prompts from file (one per line, ignore empty lines)\n"
@@ -33,10 +33,10 @@ void print_usage(std::ostream& os) {
        << "      --greedy               Use greedy decoding (override sampling)\n"
        << "  -h, --help                Show this help message\n"
        << "Examples:\n"
-       << "  ./build/easy_gpt --max-steps 128 \"Hello\"\n"
-       << "  ./build/easy_gpt --temperature 0.7 --top-p 0.9 --top-k 40 \"Hello\"\n"
-       << "  ./build/easy_gpt --greedy \"Hello\"\n"
-       << "  ./build/easy_gpt -f test/data/prompts.txt\n";
+       << "  ./build/easy_llm --max-steps 128 \"Hello\"\n"
+       << "  ./build/easy_llm --temperature 0.7 --top-p 0.9 --top-k 40 \"Hello\"\n"
+       << "  ./build/easy_llm --greedy \"Hello\"\n"
+       << "  ./build/easy_llm -f test/data/prompts.txt\n";
 }
 
 std::string apply_chat_template(const std::string& user_query) {
@@ -202,4 +202,4 @@ bool parse_args(int argc, char** argv, CliOptions* options, std::string* error) 
     return true;
 }
 
-}  // namespace easy_gpt
+}  // namespace easy_llm

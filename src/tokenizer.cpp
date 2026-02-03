@@ -15,7 +15,7 @@
 #include "config.hpp"
 #include "utils.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 using std::string;
 using std::vector;
@@ -280,4 +280,4 @@ void Tokenizer::sort_special_tokens() {
               });
 }
 
-} // namespace easy_gpt
+} // namespace easy_llm

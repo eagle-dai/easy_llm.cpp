@@ -10,7 +10,7 @@
     #include "cuda/runtime.hpp"
 #endif
 
-namespace easy_gpt {
+namespace easy_llm {
 namespace ops {
 
 using std::vector;
@@ -106,7 +106,7 @@ Tensor matmul_3d(const Tensor& input, const Tensor& weights) {
     const auto shape = validate_matmul_3d_shapes(input, weights);
 
 #if defined(USE_CUDA)
-    if (::easy_gpt::cuda::available()) {
+    if (::easy_llm::cuda::available()) {
         try {
             return matmul_3d_cuda(input, weights);
         } catch (const std::exception& e) {
@@ -374,4 +374,4 @@ std::pair<vector<float>, vector<int>> softmax(const Tensor& logits) {
 }
 
 } // namespace ops
-} // namespace easy_gpt
+} // namespace easy_llm

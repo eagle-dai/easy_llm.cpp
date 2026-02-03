@@ -11,7 +11,7 @@
 #include "ops.hpp"
 #include "sampler.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 using std::vector;
 using std::string;
@@ -351,4 +351,4 @@ void GptModel::reset_kv_cache() {
     }
 }
 
-} // namespace easy_gpt
+} // namespace easy_llm

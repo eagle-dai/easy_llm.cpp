@@ -1,5 +1,5 @@
-#ifndef EASY_GPT_MODELS_SELF_ATTN_HPP
-#define EASY_GPT_MODELS_SELF_ATTN_HPP
+#ifndef EASY_LLM_MODELS_SELF_ATTN_HPP
+#define EASY_LLM_MODELS_SELF_ATTN_HPP
 
 #include <vector>
 #include <memory>
@@ -11,7 +11,7 @@
 #include "models/linear.hpp"
 #include "models/norm.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 class SelfAttn {
 public:
@@ -56,6 +56,6 @@ private:
 
 };
 
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_MODELS_SELF_ATTN_HPP
+#endif // EASY_LLM_MODELS_SELF_ATTN_HPP

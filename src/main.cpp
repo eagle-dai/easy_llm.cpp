@@ -23,22 +23,22 @@ int main(int argc, char** argv) {
     spdlog::set_level(spdlog::level::debug);
     spdlog::info("start gpt_engine running");
 
-    easy_gpt::CliOptions options;
+    easy_llm::CliOptions options;
     string parse_error;
-    if (!easy_gpt::parse_args(argc, argv, &options, &parse_error)) {
+    if (!easy_llm::parse_args(argc, argv, &options, &parse_error)) {
         spdlog::error(parse_error);
-        easy_gpt::print_usage(std::cerr);
+        easy_llm::print_usage(std::cerr);
         return 1;
     }
     if (options.show_help) {
-        easy_gpt::print_usage(std::cout);
+        easy_llm::print_usage(std::cout);
         return 0;
     }
 
     vector<string> prompts;
     if (!options.prompt_file.empty()) {
         string file_error;
-        if (!easy_gpt::read_prompts_file(options.prompt_file, &prompts, &file_error)) {
+        if (!easy_llm::read_prompts_file(options.prompt_file, &prompts, &file_error)) {
             spdlog::error(file_error);
             return 1;
         }
@@ -48,11 +48,11 @@ int main(int argc, char** argv) {
     }
     if (prompts.empty()) {
         spdlog::error("No prompts provided");
-        easy_gpt::print_usage(std::cerr);
+        easy_llm::print_usage(std::cerr);
         return 1;
     }
     for (string& prompt : prompts) {
-        prompt = easy_gpt::apply_chat_template(prompt);
+        prompt = easy_llm::apply_chat_template(prompt);
     }
 
     std::string output_path;
@@ -64,7 +64,7 @@ int main(int argc, char** argv) {
         output_path = (prompt_path.parent_path() / output_name).string();
     }
 
-    auto config = make_unique<easy_gpt::Config>();
+    auto config = make_unique<easy_llm::Config>();
     config->load_config();
     config->max_steps = options.max_steps;
     config->temperature = options.temperature;
@@ -72,11 +72,11 @@ int main(int argc, char** argv) {
     config->top_k = options.top_k;
     config->seed = options.seed;
     config->use_greedy = options.use_greedy;
-    auto model_param = easy_gpt::ModelParam::load(config->model_path);
-    auto tokenizer = easy_gpt::Tokenizer::create(*config);
-    auto data_manager = make_unique<easy_gpt::DataManager>(move(tokenizer));
-    auto gpt_model = easy_gpt::GptModel::create(*config, *data_manager, *model_param);
-    easy_gpt::GptEngine gpt_engine{move(gpt_model), move(config), move(data_manager)};
+    auto model_param = easy_llm::ModelParam::load(config->model_path);
+    auto tokenizer = easy_llm::Tokenizer::create(*config);
+    auto data_manager = make_unique<easy_llm::DataManager>(move(tokenizer));
+    auto gpt_model = easy_llm::GptModel::create(*config, *data_manager, *model_param);
+    easy_llm::GptEngine gpt_engine{move(gpt_model), move(config), move(data_manager)};
     gpt_engine.run(prompts, output_path);
     spdlog::info("end gpt_engine running");
     return 0;

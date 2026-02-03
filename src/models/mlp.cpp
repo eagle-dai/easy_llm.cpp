@@ -3,7 +3,7 @@
 #include <spdlog/spdlog.h>
 #include "ops.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 MLP::MLP() {}
 
@@ -30,4 +30,4 @@ Tensor MLP::forward(const Tensor& input) const {
     return result;
 }
 
-} // namespace easy_gpt
+} // namespace easy_llm

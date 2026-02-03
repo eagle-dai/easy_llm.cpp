@@ -1,5 +1,5 @@
-#ifndef EASY_GPT_MODELS_GPT_MODEL_HPP
-#define EASY_GPT_MODELS_GPT_MODEL_HPP
+#ifndef EASY_LLM_MODELS_GPT_MODEL_HPP
+#define EASY_LLM_MODELS_GPT_MODEL_HPP
 
 #include <vector>
 #include <memory>
@@ -17,7 +17,7 @@
 #include "models/norm.hpp"
 #include "models/linear.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 class GptModel {
 public:
@@ -64,6 +64,6 @@ private:
 
 };
 
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_MODELS_GPT_MODEL_HPP
+#endif // EASY_LLM_MODELS_GPT_MODEL_HPP

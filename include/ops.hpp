@@ -1,10 +1,10 @@
-#ifndef EASY_GPT_OPS_HPP
-#define EASY_GPT_OPS_HPP
+#ifndef EASY_LLM_OPS_HPP
+#define EASY_LLM_OPS_HPP
 
 #include <vector>
 #include "tensor.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 namespace ops {
 
 Tensor matmul_3d(const Tensor& input, const Tensor& weights);
@@ -16,6 +16,6 @@ void apply_rope(Tensor& input, int offset = 0, float rope_theta = 10000.f);
 std::pair<std::vector<float>, std::vector<int>> softmax(const Tensor& logits);
 
 } // namespace ops
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_OPS_HPP
+#endif // EASY_LLM_OPS_HPP

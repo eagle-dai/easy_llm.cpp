@@ -11,7 +11,7 @@
     #include "cuda/runtime.hpp"
 #endif
 
-namespace easy_gpt {
+namespace easy_llm {
 
 using std::vector;
 using std::string;
@@ -42,4 +42,4 @@ void GptEngine::run(const vector<string>& prompts, const string& output_path) {
     data_manager_->log_outputs(output_path);
 }
 
-} // namespace easy_gpt
+} // namespace easy_llm

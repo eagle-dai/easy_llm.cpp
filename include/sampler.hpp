@@ -1,9 +1,9 @@
-#ifndef EASY_GPT_SAMPLER_HPP
-#define EASY_GPT_SAMPLER_HPP
+#ifndef EASY_LLM_SAMPLER_HPP
+#define EASY_LLM_SAMPLER_HPP
 
 #include <random>
 
-namespace easy_gpt {
+namespace easy_llm {
 
 class Sampler {
     public:
@@ -38,6 +38,6 @@ private:
     std::mt19937& rng_;
 };
 
-}  // namespace easy_gpt
+}  // namespace easy_llm
 
-#endif  // EASY_GPT_SAMPLER_HPP
+#endif  // EASY_LLM_SAMPLER_HPP

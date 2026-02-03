@@ -7,7 +7,7 @@
 #include "runtime_internal.hpp"
 #include "spdlog/spdlog.h"
 
-namespace easy_gpt {
+namespace easy_llm {
 namespace cuda {
 namespace {
 
@@ -169,4 +169,4 @@ void clear_weight_cache() {
 }
 
 } // namespace cuda
-} // namespace easy_gpt
+} // namespace easy_llm

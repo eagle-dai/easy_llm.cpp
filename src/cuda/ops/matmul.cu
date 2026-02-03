@@ -10,13 +10,13 @@
 #include "../device_buffer.hpp"
 #include "../runtime_internal.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 namespace ops {
 
 Tensor matmul_3d_cuda(const Tensor& input, const Tensor& weights) {
-    using Traits = ::easy_gpt::cuda::CudaPrecisionTraits<data_type>;
+    using Traits = ::easy_llm::cuda::CudaPrecisionTraits<data_type>;
 
-    auto& ctx = ::easy_gpt::cuda::get_context();
+    auto& ctx = ::easy_llm::cuda::get_context();
     if (!ctx.available()) {
         throw std::runtime_error("CUDA is not available");
     }
@@ -48,14 +48,14 @@ Tensor matmul_3d_cuda(const Tensor& input, const Tensor& weights) {
 
     std::lock_guard<std::mutex> lock(ctx.mutex());
 
-    ::easy_gpt::cuda::DeviceBuffer d_input(input_bytes);
-    ::easy_gpt::cuda::DeviceBuffer d_output(output_bytes);
+    ::easy_llm::cuda::DeviceBuffer d_input(input_bytes);
+    ::easy_llm::cuda::DeviceBuffer d_output(output_bytes);
 
-    ::easy_gpt::cuda::cuda_check(cudaMemcpyAsync(d_input.data(), input.data().data(), input_bytes,
+    ::easy_llm::cuda::cuda_check(cudaMemcpyAsync(d_input.data(), input.data().data(), input_bytes,
                                                  cudaMemcpyHostToDevice, ctx.stream()),
                                  "cudaMemcpyAsync input");
 
-    ::easy_gpt::cuda::WeightEntry& weights_entry = ctx.cache().get_or_upload(weights, ctx.stream());
+    ::easy_llm::cuda::WeightEntry& weights_entry = ctx.cache().get_or_upload(weights, ctx.stream());
 
     const float alpha = 1.0f;
     const float beta = 0.0f;
@@ -75,16 +75,16 @@ Tensor matmul_3d_cuda(const Tensor& input, const Tensor& weights) {
         ctx.disable("cublasGemmEx not supported on this device");
         throw std::runtime_error("cublasGemmEx not supported");
     }
-    ::easy_gpt::cuda::cublas_check(gemm_status, "cublasGemmEx");
+    ::easy_llm::cuda::cublas_check(gemm_status, "cublasGemmEx");
 
-    ::easy_gpt::cuda::cuda_check(cudaMemcpyAsync(output.data().data(), d_output.data(), output_bytes,
+    ::easy_llm::cuda::cuda_check(cudaMemcpyAsync(output.data().data(), d_output.data(), output_bytes,
                                                  cudaMemcpyDeviceToHost, ctx.stream()),
                                  "cudaMemcpyAsync output");
-    ::easy_gpt::cuda::cuda_check(cudaStreamSynchronize(ctx.stream()), "cudaStreamSynchronize");
+    ::easy_llm::cuda::cuda_check(cudaStreamSynchronize(ctx.stream()), "cudaStreamSynchronize");
 
     output.reshape({batch, seq_len, height});
     return output;
 }
 
 } // namespace ops
-} // namespace easy_gpt
+} // namespace easy_llm

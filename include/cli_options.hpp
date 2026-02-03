@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-namespace easy_gpt {
+namespace easy_llm {
 
 struct CliOptions {
     std::string prompt_file;
@@ -23,4 +23,4 @@ bool parse_args(int argc, char** argv, CliOptions* options, std::string* error);
 bool read_prompts_file(const std::string& path, std::vector<std::string>* prompts, std::string* error);
 std::string apply_chat_template(const std::string& user_query);
 
-}  // namespace easy_gpt
+}  // namespace easy_llm

@@ -1,5 +1,5 @@
-#ifndef EASY_GPT_GPTENGINE_HPP
-#define EASY_GPT_GPTENGINE_HPP
+#ifndef EASY_LLM_GPTENGINE_HPP
+#define EASY_LLM_GPTENGINE_HPP
 
 #include <memory>
 #include <string>
@@ -10,7 +10,7 @@
 #include "tokenizer.hpp"
 #include "models/gpt_model.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 class GptEngine {
 public:
@@ -28,6 +28,6 @@ private:
     std::unique_ptr<GptModel> model_;
 };
 
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_GPTENGINE_HPP
+#endif // EASY_LLM_GPTENGINE_HPP

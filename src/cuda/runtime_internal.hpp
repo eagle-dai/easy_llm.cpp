@@ -1,5 +1,5 @@
-#ifndef EASY_GPT_CUDA_RUNTIME_INTERNAL_HPP
-#define EASY_GPT_CUDA_RUNTIME_INTERNAL_HPP
+#ifndef EASY_LLM_CUDA_RUNTIME_INTERNAL_HPP
+#define EASY_LLM_CUDA_RUNTIME_INTERNAL_HPP
 
 #include <cstddef>
 #include <functional>
@@ -11,7 +11,7 @@
 
 #include "tensor.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 namespace cuda {
 
 void cuda_check(cudaError_t status, const char* msg);
@@ -81,6 +81,6 @@ private:
 CudaContext& get_context();
 
 } // namespace cuda
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_CUDA_RUNTIME_INTERNAL_HPP
+#endif // EASY_LLM_CUDA_RUNTIME_INTERNAL_HPP

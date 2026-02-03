@@ -1,5 +1,5 @@
-#ifndef EASY_GPT_NORM_HPP
-#define EASY_GPT_NORM_HPP
+#ifndef EASY_LLM_NORM_HPP
+#define EASY_LLM_NORM_HPP
 
 #include <array>
 #include <vector>
@@ -10,7 +10,7 @@
 #include "config.hpp"
 #include "models/loader.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 class RMSNorm {
 public:
@@ -23,6 +23,6 @@ private:
     int dim_;
 };
 
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_NORM_HPP
+#endif // EASY_LLM_NORM_HPP

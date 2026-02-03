@@ -9,7 +9,7 @@
 
 #include "spdlog/spdlog.h"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 std::mt19937 gen(std::random_device{}());
 std::uniform_real_distribution<> dis(-0.1, 0.1);
@@ -149,4 +149,4 @@ vector<char> read_bytes(std::ifstream& file, size_t num_bytes) {
 }
 
 } // namespace utils
-} // namespace easy_gpt
+} // namespace easy_llm

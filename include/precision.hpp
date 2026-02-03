@@ -1,9 +1,9 @@
-#ifndef EASY_GPT_PRECISION_HPP
-#define EASY_GPT_PRECISION_HPP
+#ifndef EASY_LLM_PRECISION_HPP
+#define EASY_LLM_PRECISION_HPP
 
 #include <cstddef>
 
-namespace easy_gpt {
+namespace easy_llm {
 namespace precision_config {
 
 enum class Kind {
@@ -42,6 +42,6 @@ constexpr size_t element_bytes() {
 
 } // namespace precision_config
 
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_PRECISION_HPP
+#endif // EASY_LLM_PRECISION_HPP

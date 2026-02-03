@@ -5,7 +5,7 @@
 #include "utils.hpp"
 #include "ops.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 extern std::mt19937 gen;
 extern std::uniform_real_distribution<> dis;
@@ -54,4 +54,4 @@ Tensor Linear::forward(const Tensor& input) const {
     return result;
 }
 
-} // namespace easy_gpt
+} // namespace easy_llm

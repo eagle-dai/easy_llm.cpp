@@ -1,5 +1,5 @@
-#ifndef EASY_GPT_MODELS_BLOCK_HPP
-#define EASY_GPT_MODELS_BLOCK_HPP
+#ifndef EASY_LLM_MODELS_BLOCK_HPP
+#define EASY_LLM_MODELS_BLOCK_HPP
 
 #include <vector>
 #include <memory>
@@ -11,7 +11,7 @@
 #include "models/self_attn.hpp"
 #include "models/mlp.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 class Block {
 public:
@@ -32,6 +32,6 @@ private:
     MLP mlp_;
 };
 
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_MODELS_BLOCK_HPP
+#endif // EASY_LLM_MODELS_BLOCK_HPP

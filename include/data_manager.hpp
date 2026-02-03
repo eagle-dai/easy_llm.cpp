@@ -1,5 +1,5 @@
-#ifndef EASY_GPT_DATA_MANAGER_HPP
-#define EASY_GPT_DATA_MANAGER_HPP
+#ifndef EASY_LLM_DATA_MANAGER_HPP
+#define EASY_LLM_DATA_MANAGER_HPP
 
 #include <string>
 #include <vector>
@@ -8,7 +8,7 @@
 #include "tokenizer.hpp"
 #include "tensor.hpp"
 
-namespace easy_gpt {
+namespace easy_llm {
 
 struct InputSample {
     InputSample(std::string original_text) : 
@@ -61,6 +61,6 @@ private:
     bool append_output_token(OutputSample& output, int token_id, const std::string& token_str) const;
 };
 
-} // namespace easy_gpt
+} // namespace easy_llm
 
-#endif // EASY_GPT_DATA_MANAGER_HPP
+#endif // EASY_LLM_DATA_MANAGER_HPP
