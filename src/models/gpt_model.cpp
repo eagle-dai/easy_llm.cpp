@@ -10,6 +10,7 @@
 #include <spdlog/spdlog.h>
 #include "ops.hpp"
 #include "sampler.hpp"
+#include "models/layer_key_prefix.hpp"
 
 namespace easy_llm {
 
@@ -132,6 +133,7 @@ std::unique_ptr<GptModel> GptModel::create(const Config& config, DataManager& da
 GptModel::GptModel(const Config& config, DataManager& data_manager)
     : config_(config),
       data_manager_(data_manager),
+      layer_key_prefix_(create_layer_key_prefix(config)),
       rng_(static_cast<uint32_t>(config.seed)),
       sampler_(std::make_unique<TopKTopPSampler>(config.temperature, config.top_p, config.top_k, config.use_greedy, rng_)) {
 }
@@ -152,10 +154,9 @@ void GptModel::init_from_config() {
 void GptModel::load_param(ModelParam& model_param) {
     embedding_->load_param(model_param);
     for (int i = 0; i < num_blocks_; ++i) {
-        string param_key_prefix = "model.layers.";
-        blocks_[i]->load_param(param_key_prefix + std::to_string(i), model_param);
+        blocks_[i]->load_param(*layer_key_prefix_, layer_key_prefix_->layer(i), model_param);
     }
-    norm_.load_param("model.norm", model_param);
+    norm_.load_param(layer_key_prefix_->model_norm(), model_param);
 }
 
 string GptModel::forward(const vector<vector<int>>& input) {

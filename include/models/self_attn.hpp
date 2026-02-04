@@ -13,6 +13,8 @@
 
 namespace easy_llm {
 
+class LayerKeyPrefix;
+
 class SelfAttn {
 public:
     SelfAttn();
@@ -20,7 +22,7 @@ public:
     SelfAttn(int hidden_dim, int num_heads);
 
     Tensor forward(const Tensor& input, const std::vector<int>& sample_ids, const std::vector<int>* pos_offsets = nullptr);
-    void load_param(const std::string& key, ModelParam& model_param);
+    void load_param(const LayerKeyPrefix& key_prefix, const std::string& key, ModelParam& model_param);
     void init_kv_cache(int batch_size);
     void clear_kv_cache(int sample_id);
     void reset_kv_cache();

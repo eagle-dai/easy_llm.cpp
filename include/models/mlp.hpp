@@ -12,13 +12,15 @@
 
 namespace easy_llm {
 
+class LayerKeyPrefix;
+
 class MLP {
 public:
     MLP();
     MLP(int hidden_dim);
 
     Tensor forward(const Tensor& input) const;
-    void load_param(const std::string& key, ModelParam& model_param);
+    void load_param(const LayerKeyPrefix& key_prefix, const std::string& key, ModelParam& model_param);
 
 private:
     Linear up_proj_;

@@ -4,6 +4,7 @@
 #include "ops.hpp"
 
 #include "config.hpp"
+#include "models/layer_key_prefix.hpp"
 
 namespace easy_llm {
 
@@ -14,9 +15,9 @@ Block::Block(const Config& config)
     : self_attn_(config) {
 }
 
-void Block::load_param(const std::string& key, ModelParam& model_param) {
-    self_attn_.load_param(key, model_param);
-    mlp_.load_param(key, model_param);
+void Block::load_param(const LayerKeyPrefix& key_prefix, const std::string& key, ModelParam& model_param) {
+    self_attn_.load_param(key_prefix, key, model_param);
+    mlp_.load_param(key_prefix, key, model_param);
 }
 
 Tensor Block::forward(const Tensor& input, const std::vector<int>& sample_ids, const std::vector<int>* pos_offsets) {

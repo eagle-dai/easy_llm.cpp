@@ -22,9 +22,16 @@ void Config::load_config() {
     bos_token_id = json_data.value("bos_token_id", bos_token_id);
     eos_token_id = json_data.value("eos_token_id", eos_token_id);
     rope_theta = json_data.value("rope_theta", rope_theta);
+    model_type = json_data.value("model_type", model_type);
+    if (json_data.contains("architectures") &&
+        json_data["architectures"].is_array() &&
+        !json_data["architectures"].empty() &&
+        json_data["architectures"][0].is_string()) {
+        architecture = json_data["architectures"][0].get<std::string>();
+    }
 
     spdlog::info(
-        "Loaded model config: layers={}, heads={}, kv_heads={}, hidden_size={}, vocab_size={}, max_len={}, bos={}, eos={}, rope_theta={}",
+        "Loaded model config: layers={}, heads={}, kv_heads={}, hidden_size={}, vocab_size={}, max_len={}, bos={}, eos={}, rope_theta={}, architecture={}, model_type={}",
         num_layers,
         num_heads,
         num_heads_kv,
@@ -33,7 +40,9 @@ void Config::load_config() {
         max_len,
         bos_token_id,
         eos_token_id,
-        rope_theta
+        rope_theta,
+        architecture,
+        model_type
     );
 }
 

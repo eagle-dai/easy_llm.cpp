@@ -8,6 +8,7 @@
 #include "ops.hpp"
 
 #include "config.hpp"
+#include "models/layer_key_prefix.hpp"
 
 namespace easy_llm {
 
@@ -180,18 +181,18 @@ SelfAttn::SelfAttn(int hidden_dim, int num_heads)
       o_proj_(hidden_dim, hidden_dim) {
 }
 
-void SelfAttn::load_param(const std::string& key, ModelParam& model_param) {
-    q_proj_.load_param(key + ".self_attn.q_proj", model_param);
-    k_proj_.load_param(key + ".self_attn.k_proj", model_param);
-    v_proj_.load_param(key + ".self_attn.v_proj", model_param);
-    o_proj_.load_param(key + ".self_attn.o_proj", model_param);
+void SelfAttn::load_param(const LayerKeyPrefix& key_prefix, const std::string& key, ModelParam& model_param) {
+    q_proj_.load_param(key_prefix.self_attn_q_proj(key), model_param);
+    k_proj_.load_param(key_prefix.self_attn_k_proj(key), model_param);
+    v_proj_.load_param(key_prefix.self_attn_v_proj(key), model_param);
+    o_proj_.load_param(key_prefix.self_attn_o_proj(key), model_param);
     hidden_dim_ = q_proj_.get_out_dim();
     if (num_heads_ <= 0) {
         spdlog::error("num_heads_ is invalid: {}", num_heads_);
         return;
     }
     head_dim_ = hidden_dim_ / num_heads_;
-    norm_.load_param(key + ".input_layernorm", model_param);
+    norm_.load_param(key_prefix.input_layer_norm(key), model_param);
 }
 
 Tensor SelfAttn::forward(const Tensor& input, const std::vector<int>& sample_ids, const std::vector<int>* pos_offsets) {

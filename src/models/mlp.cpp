@@ -2,6 +2,7 @@
 
 #include <spdlog/spdlog.h>
 #include "ops.hpp"
+#include "models/layer_key_prefix.hpp"
 
 namespace easy_llm {
 
@@ -13,11 +14,11 @@ MLP::MLP(int hidden_dim)
       hidden_dim_(hidden_dim) {
 }
 
-void MLP::load_param(const std::string& key, ModelParam& model_param) {
-    down_proj_.load_param(key + ".mlp.down_proj", model_param);
-    gate_proj_.load_param(key + ".mlp.gate_proj", model_param);
-    up_proj_.load_param(key + ".mlp.up_proj", model_param);
-    norm_.load_param(key + ".post_attention_layernorm", model_param);
+void MLP::load_param(const LayerKeyPrefix& key_prefix, const std::string& key, ModelParam& model_param) {
+    down_proj_.load_param(key_prefix.mlp_down_proj(key), model_param);
+    gate_proj_.load_param(key_prefix.mlp_gate_proj(key), model_param);
+    up_proj_.load_param(key_prefix.mlp_up_proj(key), model_param);
+    norm_.load_param(key_prefix.post_attention_layer_norm(key), model_param);
 }
 
 Tensor MLP::forward(const Tensor& input) const {

@@ -25,6 +25,8 @@ struct Config {
     int top_k{0};
     int seed{42};
     bool use_greedy{false};
+    std::string architecture;
+    std::string model_type;
 
     std::string data_path;
     std::string model_config_path{"data/model/config.json"};

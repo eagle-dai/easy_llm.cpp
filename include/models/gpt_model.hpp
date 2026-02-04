@@ -19,6 +19,8 @@
 
 namespace easy_llm {
 
+class LayerKeyPrefix;
+
 class GptModel {
 public:
     static std::unique_ptr<GptModel> create(const Config& config, DataManager& data_manager, ModelParam& model_param);
@@ -59,6 +61,7 @@ private:
     std::vector<std::unique_ptr<Block>> blocks_;
     RMSNorm norm_{};
     std::unique_ptr<Linear> out_linear_{std::make_unique<Linear>()};
+    std::unique_ptr<LayerKeyPrefix> layer_key_prefix_;
     std::mt19937 rng_;
     std::unique_ptr<Sampler> sampler_;
 
