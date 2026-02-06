@@ -3,6 +3,9 @@
 #include <spdlog/spdlog.h>
 #include "ops.hpp"
 #include "models/layer_key_prefix.hpp"
+#ifdef USE_CUDA
+    #include "cuda/runtime.hpp"
+#endif
 
 namespace easy_llm {
 
@@ -22,6 +25,20 @@ void MLP::load_param(const LayerKeyPrefix& key_prefix, const std::string& key, M
 }
 
 Tensor MLP::forward(const Tensor& input) const {
+#ifdef USE_CUDA
+    if (cuda_enabled_ && ::easy_llm::cuda::available()) {
+        try {
+            return forward_cuda(input);
+        } catch (const std::exception& e) {
+            cuda_enabled_ = false;
+            spdlog::error("MLP CUDA forward failed. Falling back to CPU path: {}", e.what());
+        }
+    }
+#endif
+    return forward_cpu(input);
+}
+
+Tensor MLP::forward_cpu(const Tensor& input) const {
     auto input_norm = norm_.forward(input);
     auto hidden = up_proj_.forward(input_norm);
     auto gate = gate_proj_.forward(input_norm);
@@ -30,5 +47,16 @@ Tensor MLP::forward(const Tensor& input) const {
     auto result = down_proj_.forward(hidden);
     return result;
 }
+
+#ifdef USE_CUDA
+Tensor MLP::forward_cuda(const Tensor& input) const {
+    return cuda::ops::mlp_forward_cuda(
+        input,
+        norm_.weight(),
+        up_proj_.weights(), up_proj_.bias(),
+        gate_proj_.weights(), gate_proj_.bias(),
+        down_proj_.weights(), down_proj_.bias());
+}
+#endif
 
 } // namespace easy_llm

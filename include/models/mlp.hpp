@@ -9,6 +9,9 @@
 #include "models/loader.hpp"
 #include "models/linear.hpp"
 #include "models/norm.hpp"
+#ifdef USE_CUDA
+    #include "cuda/ops/mlp.hpp"
+#endif
 
 namespace easy_llm {
 
@@ -23,6 +26,12 @@ public:
     void load_param(const LayerKeyPrefix& key_prefix, const std::string& key, ModelParam& model_param);
 
 private:
+    Tensor forward_cpu(const Tensor& input) const;
+#ifdef USE_CUDA
+    Tensor forward_cuda(const Tensor& input) const;
+    mutable bool cuda_enabled_{true};
+#endif
+
     Linear up_proj_;
     Linear gate_proj_;
     Linear down_proj_;
