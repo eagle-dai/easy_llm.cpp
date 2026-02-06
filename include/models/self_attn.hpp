@@ -10,6 +10,9 @@
 #include "models/loader.hpp"
 #include "models/linear.hpp"
 #include "models/norm.hpp"
+#ifdef USE_CUDA
+    #include "cuda/ops/self_attn.hpp"
+#endif
 
 namespace easy_llm {
 
@@ -31,6 +34,7 @@ public:
 private:
     struct ForwardContext;
 
+    Tensor forward_cpu(const Tensor& input, const std::vector<int>& sample_ids, const std::vector<int>* pos_offsets);
     void validate_forward_inputs(const ForwardContext& ctx) const;
     void compute_offsets(ForwardContext& ctx) const;
     void apply_rope_offsets(Tensor& q, Tensor& k, const ForwardContext& ctx);
@@ -55,6 +59,12 @@ private:
     std::vector<Tensor> cache_v_by_sample_;
     std::vector<int> cache_len_by_sample_;
     std::vector<int> pad_lens_by_sample_;
+
+#ifdef USE_CUDA
+    Tensor forward_cuda(const Tensor& input, const std::vector<int>& sample_ids, const std::vector<int>& offsets);
+    bool cuda_enabled_{true};
+    std::unique_ptr<cuda::ops::SelfAttnCudaState> cuda_state_;
+#endif
 
 };
 

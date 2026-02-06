@@ -18,6 +18,9 @@ public:
     Tensor forward(const Tensor& input) const;
     void load_param(const std::string& key, ModelParam& model_param);
     int get_out_dim() const { return out_dim_; }
+    int get_in_dim() const { return in_dim_; }
+    const Tensor& weights() const { return weights_; }
+    const Tensor& bias() const { return bias_; }
 
 private:
     Tensor weights_;

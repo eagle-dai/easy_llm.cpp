@@ -37,6 +37,7 @@ if(EASY_LLM_ENABLE_CUDA)
     list(APPEND EASY_LLM_CORE_SOURCES
         "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/runtime.cu"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/ops/matmul.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/ops/self_attn.cu"
     )
 endif()
 
@@ -81,3 +82,10 @@ endif()
 
 add_executable(easy_llm src/main.cpp)
 target_link_libraries(easy_llm PRIVATE easy_llm_core)
+
+if(EASY_LLM_ENABLE_CUDA)
+    enable_testing()
+    add_executable(easy_llm_self_attn_cuda_test test/self_attn_cuda_test.cpp)
+    target_link_libraries(easy_llm_self_attn_cuda_test PRIVATE easy_llm_core)
+    add_test(NAME easy_llm_self_attn_cuda_test COMMAND easy_llm_self_attn_cuda_test)
+endif()

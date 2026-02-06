@@ -7,6 +7,10 @@
 #include <spdlog/spdlog.h>
 #include "ops.hpp"
 
+#ifdef USE_CUDA
+    #include "cuda/runtime.hpp"
+#endif
+
 #include "config.hpp"
 #include "models/layer_key_prefix.hpp"
 
@@ -205,6 +209,42 @@ Tensor SelfAttn::forward(const Tensor& input, const std::vector<int>& sample_ids
     ctx.max_sample_id = *std::max_element(ctx.sample_ids.begin(), ctx.sample_ids.end());
     ensure_cache_capacity(ctx.max_sample_id + 1);
 
+    compute_offsets(ctx);
+
+#ifdef USE_CUDA
+    if (cuda_enabled_ && ::easy_llm::cuda::available()) {
+        try {
+            auto output = forward_cuda(input, sample_ids, ctx.offsets);
+            return output;
+        } catch (const std::exception& e) {
+            bool has_cuda_cache = false;
+            if (cuda_state_) {
+                for (int i = 0; i <= ctx.max_sample_id; ++i) {
+                    if (cuda_state_->cache_len(i) > 0) {
+                        has_cuda_cache = true;
+                        break;
+                    }
+                }
+            }
+            if (has_cuda_cache) {
+                spdlog::error("SelfAttn CUDA forward failed with active CUDA KV cache. Fallback is unsafe: {}", e.what());
+                throw;
+            }
+            cuda_enabled_ = false;
+            spdlog::error("SelfAttn CUDA forward failed. Falling back to CPU path: {}", e.what());
+        }
+    }
+#endif
+    return forward_cpu(input, sample_ids, pos_offsets);
+}
+
+Tensor SelfAttn::forward_cpu(const Tensor& input, const std::vector<int>& sample_ids, const std::vector<int>* pos_offsets) {
+    ForwardContext ctx(input, sample_ids, pos_offsets);
+    validate_forward_inputs(ctx);
+    ctx.max_sample_id = *std::max_element(ctx.sample_ids.begin(), ctx.sample_ids.end());
+    ensure_cache_capacity(ctx.max_sample_id + 1);
+    compute_offsets(ctx);
+
     auto input_norm = norm_.forward(input);
     auto q = q_proj_.forward(input_norm);  // [batch, seq, hidden_dim]
     auto k = k_proj_.forward(input_norm);
@@ -215,7 +255,6 @@ Tensor SelfAttn::forward(const Tensor& input, const std::vector<int>& sample_ids
     validate_tensor_size(q, "q");
     validate_tensor_size(k, "k");
     validate_tensor_size(v, "v");
-    compute_offsets(ctx);
     apply_rope_offsets(q, k, ctx);
 
     expand_kv_heads(k, v);
@@ -240,6 +279,39 @@ Tensor SelfAttn::forward(const Tensor& input, const std::vector<int>& sample_ids
     auto output = o_proj_.forward(attn_output);
     return output;
 }
+
+#ifdef USE_CUDA
+Tensor SelfAttn::forward_cuda(const Tensor& input,
+                              const std::vector<int>& sample_ids,
+                              const std::vector<int>& offsets) {
+    if (!cuda_state_) {
+        cuda_state_ = std::make_unique<cuda::ops::SelfAttnCudaState>();
+    }
+    cuda::ops::SelfAttnCudaParams params{};
+    params.hidden_dim = hidden_dim_;
+    params.num_heads = num_heads_;
+    params.num_heads_kv = num_heads_kv_;
+    params.head_dim = head_dim_;
+    params.rope_theta = rope_theta_;
+
+    Tensor output = cuda::ops::self_attn_forward_cuda(
+        input, sample_ids, offsets, pad_lens_by_sample_, params,
+        norm_.weight(),
+        q_proj_.weights(), q_proj_.bias(),
+        k_proj_.weights(), k_proj_.bias(),
+        v_proj_.weights(), v_proj_.bias(),
+        o_proj_.weights(), o_proj_.bias(),
+        *cuda_state_);
+
+    for (int sample_id : sample_ids) {
+        ensure_cache_capacity(sample_id + 1);
+        cache_len_by_sample_[sample_id] = cuda_state_->cache_len(sample_id);
+        cache_k_by_sample_[sample_id] = Tensor();
+        cache_v_by_sample_[sample_id] = Tensor();
+    }
+    return output;
+}
+#endif
 
 void SelfAttn::validate_forward_inputs(const ForwardContext& ctx) const {
     if (ctx.input.shape()[0] != static_cast<int>(ctx.sample_ids.size())) {
@@ -296,6 +368,13 @@ void SelfAttn::init_kv_cache(int batch_size) {
     cache_k_by_sample_.assign(batch_size, Tensor());
     cache_v_by_sample_.assign(batch_size, Tensor());
     cache_len_by_sample_.assign(batch_size, 0);
+#ifdef USE_CUDA
+    if (!cuda_state_) {
+        cuda_state_ = std::make_unique<cuda::ops::SelfAttnCudaState>();
+    }
+    cuda_state_->init_kv_cache(batch_size);
+    cuda_enabled_ = true;
+#endif
 }
 
 void SelfAttn::clear_kv_cache(int sample_id) {
@@ -305,6 +384,11 @@ void SelfAttn::clear_kv_cache(int sample_id) {
     cache_k_by_sample_[sample_id] = Tensor();
     cache_v_by_sample_[sample_id] = Tensor();
     cache_len_by_sample_[sample_id] = 0;
+#ifdef USE_CUDA
+    if (cuda_state_) {
+        cuda_state_->clear_kv_cache(sample_id);
+    }
+#endif
 }
 
 void SelfAttn::append_kv_cache(const Tensor& k, const Tensor& v, const ForwardContext& ctx) {
@@ -388,6 +472,11 @@ void SelfAttn::reset_kv_cache() {
     cache_k_by_sample_.clear();
     cache_v_by_sample_.clear();
     cache_len_by_sample_.clear();
+#ifdef USE_CUDA
+    if (cuda_state_) {
+        cuda_state_->reset_kv_cache();
+    }
+#endif
 }
 
 void SelfAttn::set_pad_lens(const std::vector<int>& pad_lens) {

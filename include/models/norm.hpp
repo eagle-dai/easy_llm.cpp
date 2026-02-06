@@ -17,10 +17,12 @@ public:
     RMSNorm();
     void load_param(const std::string& key, ModelParam& model_param);
     Tensor forward(const Tensor& input) const;
+    const Tensor& weight() const { return weight_; }
+    int dim() const { return dim_; }
 
 private:
     Tensor weight_;
-    int dim_;
+    int dim_{0};
 };
 
 } // namespace easy_llm

@@ -115,7 +115,13 @@ void CudaContext::init() {
         using Traits = CudaPrecisionTraits<data_type>;
         int device_count = 0;
         auto device_status = cudaGetDeviceCount(&device_count);
-        if (device_status != cudaSuccess || device_count == 0) {
+        if (device_status != cudaSuccess) {
+            spdlog::warn("CUDA unavailable: cudaGetDeviceCount failed (status={}): {}",
+                         static_cast<int>(device_status), cudaGetErrorString(device_status));
+            available_ = false;
+            return;
+        }
+        if (device_count == 0) {
             spdlog::warn("CUDA unavailable: no device detected");
             available_ = false;
             return;
