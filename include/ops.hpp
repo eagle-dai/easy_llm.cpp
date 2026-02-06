@@ -8,6 +8,7 @@ namespace easy_llm {
 namespace ops {
 
 Tensor matmul_3d(const Tensor& input, const Tensor& weights);
+Tensor matmul_3d(const Tensor& input, const Tensor& weights, const Tensor& bias);
 Tensor matmul_4d(const Tensor& input, const Tensor& weights);
 void add_inplace(Tensor& target, const Tensor& source);
 Tensor multiply(const Tensor& a, const Tensor& b);

@@ -40,18 +40,7 @@ void Linear::load_param(const std::string& key, ModelParam& model_param) {
 }
 
 Tensor Linear::forward(const Tensor& input) const {
-    auto result = ops::matmul_3d(input, weights_);
-    if (bias_.size() == result.shape()[2]) {
-        // result shape == {batch, seq_len, out_dim} and bias shape == {out_dim}
-        for (int i = 0; i < result.shape()[0]; ++i) {
-            for (int j = 0; j < result.shape()[1]; ++j) {
-                for (int k = 0; k < result.shape()[2]; ++k) {
-                    result.at(i * result.shape()[1] * result.shape()[2] + j * result.shape()[2] + k) += bias_.at(k);
-                }
-            }
-        }
-    }
-    return result;
+    return ops::matmul_3d(input, weights_, bias_);
 }
 
 } // namespace easy_llm

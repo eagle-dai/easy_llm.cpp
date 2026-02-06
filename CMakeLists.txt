@@ -83,8 +83,12 @@ endif()
 add_executable(easy_llm src/main.cpp)
 target_link_libraries(easy_llm PRIVATE easy_llm_core)
 
+enable_testing()
+add_executable(easy_llm_matmul_test test/matmul_3d_test.cpp)
+target_link_libraries(easy_llm_matmul_test PRIVATE easy_llm_core)
+add_test(NAME easy_llm_matmul_test COMMAND easy_llm_matmul_test)
+
 if(EASY_LLM_ENABLE_CUDA)
-    enable_testing()
     add_executable(easy_llm_self_attn_cuda_test test/self_attn_cuda_test.cpp)
     target_link_libraries(easy_llm_self_attn_cuda_test PRIVATE easy_llm_core)
     add_test(NAME easy_llm_self_attn_cuda_test COMMAND easy_llm_self_attn_cuda_test)

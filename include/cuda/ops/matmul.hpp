@@ -7,6 +7,7 @@ namespace easy_llm {
 namespace ops {
 
 Tensor matmul_3d_cuda(const Tensor& input, const Tensor& weights);
+Tensor matmul_3d_cuda(const Tensor& input, const Tensor& weights, const Tensor& bias);
 
 } // namespace ops
 } // namespace easy_llm

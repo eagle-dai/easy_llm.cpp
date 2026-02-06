@@ -38,7 +38,8 @@ Matmul3dShape validate_matmul_3d_shapes(const Tensor& input, const Tensor& weigh
 }
 
 Tensor matmul_3d_cpu(const Tensor& input, const Tensor& weights,
-                     int batch, int seq_len, int height, int width) {
+                     int batch, int seq_len, int height, int width,
+                     const Tensor* bias) {
     Tensor output(batch * seq_len * height);
 
     // Pre-convert weights -> float (once per call)
@@ -52,6 +53,22 @@ Tensor matmul_3d_cpu(const Tensor& input, const Tensor& weights,
 #else
         weights_f[i] = static_cast<float>(weights[i]);
 #endif
+    }
+
+    const bool use_bias = (bias != nullptr && bias->size() == height);
+    std::vector<float> bias_f;
+    if (use_bias) {
+        bias_f.resize(height);
+#ifdef USE_OPENMP
+        #pragma omp parallel for
+#endif
+        for (int i = 0; i < height; ++i) {
+#ifdef USE_BF16
+            bias_f[i] = bf16_to_float((*bias)[i].data);
+#else
+            bias_f[i] = static_cast<float>((*bias)[i]);
+#endif
+        }
     }
 
     // Parallelize over (b, s) rows.
@@ -85,6 +102,9 @@ Tensor matmul_3d_cpu(const Tensor& input, const Tensor& weights,
                     for (int w = 0; w < width; ++w) {
                         sum += input_row_f[w] * wf[w];
                     }
+                    if (use_bias) {
+                        sum += bias_f[h];
+                    }
 #ifdef USE_BF16
                     output[row_id * height + h].data = float_to_bf16(sum);
 #else
@@ -98,16 +118,15 @@ Tensor matmul_3d_cpu(const Tensor& input, const Tensor& weights,
     return output;
 }
 
-} // namespace
-
-Tensor matmul_3d(const Tensor& input, const Tensor& weights) {
-    // spdlog::trace("matmul_3d input shape == {},{}", input.shape()[1], input.shape()[2]);
-    // spdlog::trace("matmul_3d weights_ shape == {},{}", weights.shape()[0], weights.shape()[1]);
+Tensor matmul_3d_impl(const Tensor& input, const Tensor& weights, const Tensor* bias) {
     const auto shape = validate_matmul_3d_shapes(input, weights);
 
 #if defined(USE_CUDA)
     if (::easy_llm::cuda::available()) {
         try {
+            if (bias != nullptr) {
+                return matmul_3d_cuda(input, weights, *bias);
+            }
             return matmul_3d_cuda(input, weights);
         } catch (const std::exception& e) {
             spdlog::error("matmul_3d CUDA failed, falling back to CPU: {}", e.what());
@@ -115,7 +134,17 @@ Tensor matmul_3d(const Tensor& input, const Tensor& weights) {
     }
 #endif
 
-    return matmul_3d_cpu(input, weights, shape.batch, shape.seq_len, shape.height, shape.width);
+    return matmul_3d_cpu(input, weights, shape.batch, shape.seq_len, shape.height, shape.width, bias);
+}
+
+} // namespace
+
+Tensor matmul_3d(const Tensor& input, const Tensor& weights) {
+    return matmul_3d_impl(input, weights, nullptr);
+}
+
+Tensor matmul_3d(const Tensor& input, const Tensor& weights, const Tensor& bias) {
+    return matmul_3d_impl(input, weights, &bias);
 }
 
 Tensor matmul_4d(const Tensor& input, const Tensor& weights) {
