@@ -557,6 +557,261 @@ __global__ void mask_scale_softmax_decode_kernel(T* scores,
 }
 
 template <typename T>
+__global__ void fused_decode_attention_kernel(const T* q,
+                                              const T* cache_k_interleaved,
+                                              const T* cache_v_interleaved,
+                                              T* context,
+                                              const int* sample_ids,
+                                              const int* pad_lens,
+                                              int pad_lens_size,
+                                              int batch,
+                                              int num_heads,
+                                              int num_heads_kv,
+                                              int repeat_factor,
+                                              int head_dim,
+                                              int cache_capacity_len,
+                                              const int* active_len_ptr,
+                                              float scale) {
+    extern __shared__ float shared[];
+    float* reduce = shared;
+    float* q_shared = reduce + blockDim.x;
+    float* acc_shared = q_shared + head_dim;
+    float* scalars = acc_shared + head_dim;
+
+    int row = blockIdx.x;
+    int row_count = batch * num_heads;
+    if (row >= row_count) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+    int b = row / num_heads;
+    int h = row % num_heads;
+    int kv_h = h / repeat_factor;
+    int q_base = (b * num_heads + h) * head_dim;
+
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        q_shared[d] = to_float(q[q_base + d]);
+        acc_shared[d] = 0.0f;
+    }
+    __syncthreads();
+
+    int active_len = cache_capacity_len;
+    if (active_len_ptr != nullptr) {
+        active_len = active_len_ptr[0];
+    }
+    if (active_len < 0) {
+        active_len = 0;
+    }
+    if (active_len > cache_capacity_len) {
+        active_len = cache_capacity_len;
+    }
+
+    int pad_len = 0;
+    if (sample_ids != nullptr && pad_lens != nullptr && pad_lens_size > 0) {
+        int sample_id = sample_ids[b];
+        if (sample_id >= 0 && sample_id < pad_lens_size) {
+            pad_len = pad_lens[sample_id];
+            if (pad_len < 0) {
+                pad_len = 0;
+            }
+            if (pad_len > active_len) {
+                pad_len = active_len;
+            }
+        }
+    }
+
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+
+    for (int t = 0; t < active_len; ++t) {
+        if (t < pad_len) {
+            continue;
+        }
+
+        int cache_base = (((b * cache_capacity_len) + t) * num_heads_kv + kv_h) * head_dim;
+        float partial = 0.0f;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            partial += q_shared[d] * to_float(cache_k_interleaved[cache_base + d]);
+        }
+        reduce[tid] = partial;
+        __syncthreads();
+
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce[tid] += reduce[tid + stride];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            float score = reduce[0] * scale;
+            float next_max = fmaxf(running_max, score);
+            float alpha = 0.0f;
+            if (isfinite(running_max)) {
+                alpha = expf(running_max - next_max);
+            }
+            float beta = expf(score - next_max);
+            running_sum = running_sum * alpha + beta;
+            running_max = next_max;
+            scalars[0] = alpha;
+            scalars[1] = beta;
+        }
+        __syncthreads();
+
+        float alpha = scalars[0];
+        float beta = scalars[1];
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            float v = to_float(cache_v_interleaved[cache_base + d]);
+            acc_shared[d] = acc_shared[d] * alpha + v * beta;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        scalars[0] = running_sum;
+    }
+    __syncthreads();
+
+    float denom = scalars[0];
+    float inv_denom = 0.0f;
+    if (denom > FLT_EPSILON * 10.0f) {
+        inv_denom = 1.0f / denom;
+    }
+    int out_base = (b * num_heads + h) * head_dim;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        context[out_base + d] = from_float<T>(acc_shared[d] * inv_denom);
+    }
+}
+
+template <typename T>
+__global__ void fused_prefill_attention_kernel(const T* q,
+                                               const T* cache_k_interleaved,
+                                               const T* cache_v_interleaved,
+                                               T* context,
+                                               const int* sample_ids,
+                                               const int* pad_lens,
+                                               int pad_lens_size,
+                                               int batch,
+                                               int num_heads,
+                                               int num_heads_kv,
+                                               int repeat_factor,
+                                               int seq_len,
+                                               int total_len,
+                                               int head_dim,
+                                               float scale) {
+    extern __shared__ float shared[];
+    float* reduce = shared;
+    float* q_shared = reduce + blockDim.x;
+    float* acc_shared = q_shared + head_dim;
+    float* scalars = acc_shared + head_dim;
+
+    int row = blockIdx.x;
+    int row_count = batch * num_heads * seq_len;
+    if (row >= row_count) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+    int b = row / (num_heads * seq_len);
+    int rem = row % (num_heads * seq_len);
+    int h = rem / seq_len;
+    int s = rem % seq_len;
+    int kv_h = h / repeat_factor;
+    int q_base = ((b * num_heads + h) * seq_len + s) * head_dim;
+
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        q_shared[d] = to_float(q[q_base + d]);
+        acc_shared[d] = 0.0f;
+    }
+    __syncthreads();
+
+    int key_limit = total_len - seq_len + s + 1;
+    if (key_limit < 0) {
+        key_limit = 0;
+    }
+    if (key_limit > total_len) {
+        key_limit = total_len;
+    }
+
+    int pad_len = 0;
+    if (sample_ids != nullptr && pad_lens != nullptr && pad_lens_size > 0) {
+        int sample_id = sample_ids[b];
+        if (sample_id >= 0 && sample_id < pad_lens_size) {
+            pad_len = pad_lens[sample_id];
+            if (pad_len < 0) {
+                pad_len = 0;
+            }
+            if (pad_len > key_limit) {
+                pad_len = key_limit;
+            }
+        }
+    }
+
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+
+    for (int t = 0; t < key_limit; ++t) {
+        if (t < pad_len) {
+            continue;
+        }
+
+        int cache_base = (((b * total_len) + t) * num_heads_kv + kv_h) * head_dim;
+        float partial = 0.0f;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            partial += q_shared[d] * to_float(cache_k_interleaved[cache_base + d]);
+        }
+        reduce[tid] = partial;
+        __syncthreads();
+
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce[tid] += reduce[tid + stride];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            float score = reduce[0] * scale;
+            float next_max = fmaxf(running_max, score);
+            float alpha = 0.0f;
+            if (isfinite(running_max)) {
+                alpha = expf(running_max - next_max);
+            }
+            float beta = expf(score - next_max);
+            running_sum = running_sum * alpha + beta;
+            running_max = next_max;
+            scalars[0] = alpha;
+            scalars[1] = beta;
+        }
+        __syncthreads();
+
+        float alpha = scalars[0];
+        float beta = scalars[1];
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            float v = to_float(cache_v_interleaved[cache_base + d]);
+            acc_shared[d] = acc_shared[d] * alpha + v * beta;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        scalars[0] = running_sum;
+    }
+    __syncthreads();
+
+    float denom = scalars[0];
+    float inv_denom = 0.0f;
+    if (denom > FLT_EPSILON * 10.0f) {
+        inv_denom = 1.0f / denom;
+    }
+    int out_base = ((b * num_heads + h) * seq_len + s) * head_dim;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        context[out_base + d] = from_float<T>(acc_shared[d] * inv_denom);
+    }
+}
+
+template <typename T>
 __global__ void merge_heads_kernel(const T* input,
                                    T* output,
                                    int batch,
@@ -901,6 +1156,35 @@ void build_cache_batch(const SelfAttnCudaState::Impl& impl,
             total_len, num_heads_kv, head_dim);
     }
     cuda_check(cudaGetLastError(), "pack_cache_interleaved_to_heads_kernel");
+}
+
+template <typename Traits>
+void build_cache_batch_interleaved(const SelfAttnCudaState::Impl& impl,
+                                   const std::vector<int>& sample_ids,
+                                   int num_heads_kv,
+                                   int total_len,
+                                   int head_dim,
+                                   DeviceBuffer& d_cache_k_batch,
+                                   DeviceBuffer& d_cache_v_batch,
+                                   cudaStream_t stream) {
+    const size_t elem_bytes = Traits::kElementBytes;
+    const int batch = static_cast<int>(sample_ids.size());
+    const size_t sample_bytes = static_cast<size_t>(num_heads_kv) * total_len * head_dim * elem_bytes;
+    ensure_device_buffer(d_cache_k_batch, sample_bytes * batch);
+    ensure_device_buffer(d_cache_v_batch, sample_bytes * batch);
+    for (int i = 0; i < batch; ++i) {
+        int sample_id = sample_ids[i];
+        const SampleCache& sample = impl.samples[sample_id];
+        if (sample.len != total_len) {
+            throw std::invalid_argument("Cache length mismatch while building interleaved batch cache.");
+        }
+        char* dst_k = static_cast<char*>(d_cache_k_batch.data()) + static_cast<size_t>(i) * sample_bytes;
+        char* dst_v = static_cast<char*>(d_cache_v_batch.data()) + static_cast<size_t>(i) * sample_bytes;
+        cuda_check(cudaMemcpyAsync(dst_k, sample.k.data(), sample_bytes, cudaMemcpyDeviceToDevice, stream),
+                   "cudaMemcpyAsync cache k batch interleaved");
+        cuda_check(cudaMemcpyAsync(dst_v, sample.v.data(), sample_bytes, cudaMemcpyDeviceToDevice, stream),
+                   "cudaMemcpyAsync cache v batch interleaved");
+    }
 }
 
 template <typename Traits>
@@ -1334,6 +1618,7 @@ Tensor self_attn_forward_cuda(const Tensor& input,
             throw std::runtime_error("self_attn_forward_cuda: cache length is zero after append.");
         }
 
+        const bool use_fused_decode_attention = true;
         const void* cache_k_ptr = nullptr;
         const void* cache_v_ptr = nullptr;
         int score_capacity = total_len;
@@ -1349,6 +1634,11 @@ Tensor self_attn_forward_cuda(const Tensor& input,
             score_capacity = std::max(single.capacity_len, total_len);
             cache_leading_dim = params.num_heads_kv * params.head_dim;
             cache_instance_stride_elems = params.head_dim;
+        } else if (use_fused_decode_attention) {
+            build_cache_batch_interleaved<Traits>(*state.impl_, sample_ids, params.num_heads_kv, total_len, params.head_dim,
+                                                  scratch.cache_k_batch, scratch.cache_v_batch, stream);
+            cache_k_ptr = scratch.cache_k_batch.data();
+            cache_v_ptr = scratch.cache_v_batch.data();
         } else {
             build_cache_batch<Traits>(*state.impl_, sample_ids, params.num_heads_kv, total_len, params.head_dim,
                                       scratch.cache_k_batch, scratch.cache_v_batch, stream);
@@ -1356,7 +1646,15 @@ Tensor self_attn_forward_cuda(const Tensor& input,
             cache_v_ptr = scratch.cache_v_batch.data();
         }
 
-        ensure_device_buffer(scratch.scores, static_cast<size_t>(batch) * params.num_heads * score_capacity * Traits::kElementBytes, scratch_realloc_counter);
+        if (use_fused_decode_attention) {
+            state.impl_->stats.decode_fused_attention_hits += 1;
+            // Decode fused path no longer needs the materialized score tensor.
+            if (scratch.scores.bytes() > 0) {
+                scratch.scores = DeviceBuffer();
+            }
+        } else {
+            ensure_device_buffer(scratch.scores, static_cast<size_t>(batch) * params.num_heads * score_capacity * Traits::kElementBytes, scratch_realloc_counter);
+        }
         ensure_device_buffer(scratch.context, static_cast<size_t>(batch) * params.num_heads * params.head_dim * Traits::kElementBytes, scratch_realloc_counter);
         ensure_device_buffer(scratch.merged, static_cast<size_t>(rows) * hidden_dim * Traits::kElementBytes, scratch_realloc_counter);
         ensure_device_buffer(scratch.output, static_cast<size_t>(rows) * o_out_dim * Traits::kElementBytes, scratch_realloc_counter);
@@ -1384,23 +1682,51 @@ Tensor self_attn_forward_cuda(const Tensor& input,
         }
 
         auto launch_decode_seq1_pipeline = [&]() {
-            launch_qk_grouped_batched_gemm<Traits>(handle, cache_k_ptr, scratch.q.data(), scratch.scores.data(),
-                                                   batch, params.num_heads_kv, repeat_factor, 1, score_capacity,
-                                                   params.head_dim, cache_leading_dim, cache_instance_stride_elems);
+            if (use_fused_decode_attention) {
+                int fused_threads = 32;
+                while (fused_threads < params.head_dim && fused_threads < kThreads) {
+                    fused_threads <<= 1;
+                }
+                const size_t fused_shared_bytes =
+                    static_cast<size_t>(fused_threads + 2 * params.head_dim + 2) * sizeof(float);
+                const int decode_rows = batch * params.num_heads;
+                const float score_scale = 1.0f / std::sqrt(static_cast<float>(params.head_dim));
+                fused_decode_attention_kernel<DeviceType><<<decode_rows, fused_threads, fused_shared_bytes, stream>>>(
+                    static_cast<const DeviceType*>(scratch.q.data()),
+                    static_cast<const DeviceType*>(cache_k_ptr),
+                    static_cast<const DeviceType*>(cache_v_ptr),
+                    static_cast<DeviceType*>(scratch.context.data()),
+                    d_sample_ids,
+                    d_pad_ptr,
+                    pad_size,
+                    batch,
+                    params.num_heads,
+                    params.num_heads_kv,
+                    repeat_factor,
+                    params.head_dim,
+                    score_capacity,
+                    d_active_len,
+                    score_scale);
+                cuda_check(cudaGetLastError(), "fused_decode_attention_kernel");
+            } else {
+                launch_qk_grouped_batched_gemm<Traits>(handle, cache_k_ptr, scratch.q.data(), scratch.scores.data(),
+                                                       batch, params.num_heads_kv, repeat_factor, 1, score_capacity,
+                                                       params.head_dim, cache_leading_dim, cache_instance_stride_elems);
 
-            const int decode_rows = batch * params.num_heads;
-            const float score_scale = 1.0f / std::sqrt(static_cast<float>(params.head_dim));
-            mask_scale_softmax_decode_kernel<DeviceType><<<decode_rows, kThreads, kThreads * sizeof(float), stream>>>(
-                static_cast<DeviceType*>(scratch.scores.data()),
-                d_sample_ids,
-                d_pad_ptr,
-                pad_size,
-                batch, params.num_heads, score_capacity, d_active_len, score_scale);
-            cuda_check(cudaGetLastError(), "mask_scale_softmax_decode_kernel");
+                const int decode_rows = batch * params.num_heads;
+                const float score_scale = 1.0f / std::sqrt(static_cast<float>(params.head_dim));
+                mask_scale_softmax_decode_kernel<DeviceType><<<decode_rows, kThreads, kThreads * sizeof(float), stream>>>(
+                    static_cast<DeviceType*>(scratch.scores.data()),
+                    d_sample_ids,
+                    d_pad_ptr,
+                    pad_size,
+                    batch, params.num_heads, score_capacity, d_active_len, score_scale);
+                cuda_check(cudaGetLastError(), "mask_scale_softmax_decode_kernel");
 
-            launch_av_grouped_batched_gemm<Traits>(handle, scratch.scores.data(), cache_v_ptr, scratch.context.data(),
-                                                   batch, params.num_heads_kv, repeat_factor, 1, score_capacity,
-                                                   params.head_dim, cache_leading_dim, cache_instance_stride_elems);
+                launch_av_grouped_batched_gemm<Traits>(handle, scratch.scores.data(), cache_v_ptr, scratch.context.data(),
+                                                       batch, params.num_heads_kv, repeat_factor, 1, score_capacity,
+                                                       params.head_dim, cache_leading_dim, cache_instance_stride_elems);
+            }
 
             const int merge_total = rows * hidden_dim;
             const int merge_blocks = (merge_total + kThreads - 1) / kThreads;
@@ -1415,7 +1741,7 @@ Tensor self_attn_forward_cuda(const Tensor& input,
         };
 
         bool launched = false;
-        if (batch == 1) {
+        if (use_fused_decode_attention && batch == 1) {
             DecodeGraphCache& decode_graph = state.impl_->decode_graph;
             const int sample_id = sample_ids[0];
             const bool can_reuse = can_reuse_decode_graph(
@@ -1553,6 +1879,7 @@ Tensor self_attn_forward_cuda(const Tensor& input,
         throw std::runtime_error("self_attn_forward_cuda: cache length is zero after append.");
     }
 
+    const bool use_fused_prefill_attention = true;
     const void* cache_k_ptr = nullptr;
     const void* cache_v_ptr = nullptr;
     int cache_leading_dim = params.head_dim;
@@ -1566,17 +1893,17 @@ Tensor self_attn_forward_cuda(const Tensor& input,
         cache_v_ptr = single.v.data();
         cache_leading_dim = params.num_heads_kv * params.head_dim;
         cache_instance_stride_elems = params.head_dim;
+    } else if (use_fused_prefill_attention) {
+        build_cache_batch_interleaved<Traits>(*state.impl_, sample_ids, params.num_heads_kv, total_len, params.head_dim,
+                                              scratch.cache_k_batch, scratch.cache_v_batch, stream);
+        cache_k_ptr = scratch.cache_k_batch.data();
+        cache_v_ptr = scratch.cache_v_batch.data();
     } else {
         build_cache_batch<Traits>(*state.impl_, sample_ids, params.num_heads_kv, total_len, params.head_dim,
                                   scratch.cache_k_batch, scratch.cache_v_batch, stream);
         cache_k_ptr = scratch.cache_k_batch.data();
         cache_v_ptr = scratch.cache_v_batch.data();
     }
-
-    ensure_device_buffer(scratch.scores, static_cast<size_t>(batch) * params.num_heads * seq_len * total_len * Traits::kElementBytes, scratch_realloc_counter);
-    launch_qk_grouped_batched_gemm<Traits>(handle, cache_k_ptr, scratch.q.data(), scratch.scores.data(),
-                                           batch, params.num_heads_kv, repeat_factor, seq_len, total_len, params.head_dim,
-                                           cache_leading_dim, cache_instance_stride_elems);
 
     const int* d_sample_ids = nullptr;
     const int* d_pad_ptr = nullptr;
@@ -1595,20 +1922,57 @@ Tensor self_attn_forward_cuda(const Tensor& input,
             &state.impl_->stats.pad_lens_uploads);
     }
 
-    int row_count = batch * params.num_heads * seq_len;
-    float score_scale = 1.0f / std::sqrt(static_cast<float>(params.head_dim));
-    mask_scale_softmax_kernel<DeviceType><<<row_count, kThreads, kThreads * sizeof(float), stream>>>(
-        static_cast<DeviceType*>(scratch.scores.data()),
-        d_sample_ids,
-        d_pad_ptr,
-        pad_size,
-        batch, params.num_heads, seq_len, total_len, score_scale);
-    cuda_check(cudaGetLastError(), "mask_scale_softmax_kernel");
-
     ensure_device_buffer(scratch.context, static_cast<size_t>(batch) * params.num_heads * seq_len * params.head_dim * Traits::kElementBytes, scratch_realloc_counter);
-    launch_av_grouped_batched_gemm<Traits>(handle, scratch.scores.data(), cache_v_ptr, scratch.context.data(),
-                                           batch, params.num_heads_kv, repeat_factor, seq_len, total_len, params.head_dim,
-                                           cache_leading_dim, cache_instance_stride_elems);
+    const float score_scale = 1.0f / std::sqrt(static_cast<float>(params.head_dim));
+    if (use_fused_prefill_attention) {
+        state.impl_->stats.prefill_fused_attention_hits += 1;
+        if (scratch.scores.bytes() > 0) {
+            scratch.scores = DeviceBuffer();
+        }
+
+        int fused_threads = 32;
+        while (fused_threads < params.head_dim && fused_threads < kThreads) {
+            fused_threads <<= 1;
+        }
+        const size_t fused_shared_bytes =
+            static_cast<size_t>(fused_threads + 2 * params.head_dim + 2) * sizeof(float);
+        const int prefill_rows = batch * params.num_heads * seq_len;
+        fused_prefill_attention_kernel<DeviceType><<<prefill_rows, fused_threads, fused_shared_bytes, stream>>>(
+            static_cast<const DeviceType*>(scratch.q.data()),
+            static_cast<const DeviceType*>(cache_k_ptr),
+            static_cast<const DeviceType*>(cache_v_ptr),
+            static_cast<DeviceType*>(scratch.context.data()),
+            d_sample_ids,
+            d_pad_ptr,
+            pad_size,
+            batch,
+            params.num_heads,
+            params.num_heads_kv,
+            repeat_factor,
+            seq_len,
+            total_len,
+            params.head_dim,
+            score_scale);
+        cuda_check(cudaGetLastError(), "fused_prefill_attention_kernel");
+    } else {
+        ensure_device_buffer(scratch.scores, static_cast<size_t>(batch) * params.num_heads * seq_len * total_len * Traits::kElementBytes, scratch_realloc_counter);
+        launch_qk_grouped_batched_gemm<Traits>(handle, cache_k_ptr, scratch.q.data(), scratch.scores.data(),
+                                               batch, params.num_heads_kv, repeat_factor, seq_len, total_len, params.head_dim,
+                                               cache_leading_dim, cache_instance_stride_elems);
+
+        const int row_count = batch * params.num_heads * seq_len;
+        mask_scale_softmax_kernel<DeviceType><<<row_count, kThreads, kThreads * sizeof(float), stream>>>(
+            static_cast<DeviceType*>(scratch.scores.data()),
+            d_sample_ids,
+            d_pad_ptr,
+            pad_size,
+            batch, params.num_heads, seq_len, total_len, score_scale);
+        cuda_check(cudaGetLastError(), "mask_scale_softmax_kernel");
+
+        launch_av_grouped_batched_gemm<Traits>(handle, scratch.scores.data(), cache_v_ptr, scratch.context.data(),
+                                               batch, params.num_heads_kv, repeat_factor, seq_len, total_len, params.head_dim,
+                                               cache_leading_dim, cache_instance_stride_elems);
+    }
 
     ensure_device_buffer(scratch.merged, static_cast<size_t>(rows) * hidden_dim * Traits::kElementBytes, scratch_realloc_counter);
     int merge_total = rows * hidden_dim;

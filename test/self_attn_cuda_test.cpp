@@ -342,6 +342,52 @@ int main() {
         return 1;
     }
 
+    // Performance regression guard (prefill-like): batch=1, seq>1 should select fused prefill attention.
+    cuda::ops::SelfAttnCudaState cuda_state_prefill;
+    cuda_state_prefill.init_kv_cache(1);
+    cuda_state_prefill.reset_stats();
+    std::vector<int> prefill_sample_ids{0};
+    std::vector<int> prefill_offsets{0};
+    std::vector<int> prefill_pad_lens{0};
+    Tensor prefill_input = make_tensor(rng, {1, 4, params.hidden_dim});
+    (void)cuda::ops::self_attn_forward_cuda(prefill_input, prefill_sample_ids, prefill_offsets, prefill_pad_lens, params,
+                                            norm_weight,
+                                            q_weight, q_bias,
+                                            k_weight, k_bias,
+                                            v_weight, v_bias,
+                                            o_weight, o_bias,
+                                            cuda_state_prefill);
+    const auto prefill_stats = cuda_state_prefill.stats();
+    if (prefill_stats.prefill_fused_attention_hits == 0) {
+        std::cerr << "FAIL: prefill fused attention kernel was not selected\n";
+        return 1;
+    }
+
+    // Regression: batch>1 prefill should also take fused prefill attention path.
+    cuda::ops::SelfAttnCudaState cuda_state_prefill_batched;
+    cuda_state_prefill_batched.init_kv_cache(2);
+    cuda_state_prefill_batched.reset_stats();
+    std::vector<int> prefill_batched_sample_ids{0, 1};
+    std::vector<int> prefill_batched_offsets{0, 0};
+    std::vector<int> prefill_batched_pad_lens{0, 1};
+    Tensor prefill_batched_input = make_tensor(rng, {2, 4, params.hidden_dim});
+    (void)cuda::ops::self_attn_forward_cuda(prefill_batched_input,
+                                            prefill_batched_sample_ids,
+                                            prefill_batched_offsets,
+                                            prefill_batched_pad_lens,
+                                            params,
+                                            norm_weight,
+                                            q_weight, q_bias,
+                                            k_weight, k_bias,
+                                            v_weight, v_bias,
+                                            o_weight, o_bias,
+                                            cuda_state_prefill_batched);
+    const auto prefill_batched_stats = cuda_state_prefill_batched.stats();
+    if (prefill_batched_stats.prefill_fused_attention_hits == 0) {
+        std::cerr << "FAIL: batched prefill fused attention kernel was not selected\n";
+        return 1;
+    }
+
     cuda_state.clear_kv_cache(0);
     if (cuda_state.cache_len(0) != 0) {
         std::cerr << "FAIL: clear_kv_cache did not reset length\n";
@@ -370,6 +416,8 @@ int main() {
     std::cout << "scratch_reallocations=" << perf_stats.scratch_reallocations
               << ", pad_lens_uploads=" << perf_stats.pad_lens_uploads
               << ", decode_seq1_path_hits=" << perf_stats.decode_seq1_path_hits
+              << ", decode_fused_attention_hits=" << perf_stats.decode_fused_attention_hits
+              << ", prefill_fused_attention_hits=" << perf_stats.prefill_fused_attention_hits
               << ", decode_graph_captures=" << perf_stats.decode_graph_captures
               << ", decode_graph_launches=" << perf_stats.decode_graph_launches
               << ", repeat_head_materializations=" << perf_stats.repeat_head_materializations
@@ -386,6 +434,10 @@ int main() {
         std::cerr << "FAIL: decode seq=1 path was not consistently selected\n";
         return 1;
     }
+    if (perf_stats.decode_fused_attention_hits < static_cast<std::uint64_t>(perf_steps)) {
+        std::cerr << "FAIL: decode fused attention kernel was not consistently selected\n";
+        return 1;
+    }
     if (perf_stats.decode_graph_captures == 0 || perf_stats.decode_graph_launches == 0) {
         std::cerr << "FAIL: decode CUDA graph was not used\n";
         return 1;
@@ -400,6 +452,41 @@ int main() {
     }
     if (perf_stats.kv_cache_head_memcpy_ops != 0) {
         std::cerr << "FAIL: per-head KV cache memcpy should be eliminated\n";
+        return 1;
+    }
+
+    // Regression: batch>1 decode seq=1 should keep using fused decode attention.
+    cuda::ops::SelfAttnCudaState cuda_state_perf_batched;
+    cuda_state_perf_batched.init_kv_cache(2);
+    cuda_state_perf_batched.reset_stats();
+    std::vector<int> perf_batched_sample_ids{0, 1};
+    std::vector<int> perf_batched_pad_lens{0, 0};
+    const int perf_batched_steps = 32;
+    for (int step = 0; step < perf_batched_steps; ++step) {
+        Tensor perf_batched_input = make_tensor(rng, {2, 1, params.hidden_dim});
+        std::vector<int> perf_batched_offsets{
+            cuda_state_perf_batched.cache_len(0),
+            cuda_state_perf_batched.cache_len(1)
+        };
+        (void)cuda::ops::self_attn_forward_cuda(perf_batched_input,
+                                                perf_batched_sample_ids,
+                                                perf_batched_offsets,
+                                                perf_batched_pad_lens,
+                                                params,
+                                                norm_weight,
+                                                q_weight, q_bias,
+                                                k_weight, k_bias,
+                                                v_weight, v_bias,
+                                                o_weight, o_bias,
+                                                cuda_state_perf_batched);
+    }
+    const auto perf_batched_stats = cuda_state_perf_batched.stats();
+    if (perf_batched_stats.decode_seq1_path_hits < static_cast<std::uint64_t>(perf_batched_steps)) {
+        std::cerr << "FAIL: batched decode seq=1 path was not consistently selected\n";
+        return 1;
+    }
+    if (perf_batched_stats.decode_fused_attention_hits < static_cast<std::uint64_t>(perf_batched_steps)) {
+        std::cerr << "FAIL: batched decode fused attention kernel was not consistently selected\n";
         return 1;
     }
 
