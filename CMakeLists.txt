@@ -39,6 +39,7 @@ if(EASY_LLM_ENABLE_CUDA)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/ops/matmul.cu"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/ops/mlp.cu"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/ops/self_attn.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/ops/self_attn_state.cu"
     )
 endif()
 
