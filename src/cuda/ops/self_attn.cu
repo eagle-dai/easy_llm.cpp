@@ -53,8 +53,6 @@ struct ForwardScratchBuffers {
     DeviceBuffer k;
     DeviceBuffer v;
     DeviceBuffer offsets;
-    DeviceBuffer k_repeat;
-    DeviceBuffer v_repeat;
     DeviceBuffer cache_k_batch;
     DeviceBuffer cache_v_batch;
     DeviceBuffer scores;
@@ -272,47 +270,42 @@ __global__ void split_transpose_seq1_kernel(const T* input,
 }
 
 template <typename T>
-__global__ void repeat_heads_kernel(const T* input,
-                                    T* output,
-                                    int batch,
-                                    int in_heads,
-                                    int repeat_factor,
-                                    int seq_len,
-                                    int head_dim) {
-    int out_heads = in_heads * repeat_factor;
+__global__ void append_kv_interleaved_kernel(const T* src_heads_major,
+                                             T* dst_interleaved,
+                                             int old_len,
+                                             int seq_len,
+                                             int num_heads_kv,
+                                             int head_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch * out_heads * seq_len * head_dim;
+    int total = seq_len * num_heads_kv * head_dim;
     if (idx >= total) {
         return;
     }
     int d = idx % head_dim;
     int s = (idx / head_dim) % seq_len;
-    int out_h = (idx / (head_dim * seq_len)) % out_heads;
-    int b = idx / (head_dim * seq_len * out_heads);
-    int in_h = out_h / repeat_factor;
-    int in_idx = (((b * in_heads + in_h) * seq_len + s) * head_dim) + d;
-    output[idx] = input[in_idx];
+    int h = idx / (head_dim * seq_len);
+    int src_idx = ((h * seq_len + s) * head_dim) + d;
+    int dst_idx = (((old_len + s) * num_heads_kv + h) * head_dim) + d;
+    dst_interleaved[dst_idx] = src_heads_major[src_idx];
 }
 
 template <typename T>
-__global__ void repeat_heads_seq1_kernel(const T* input,
-                                         T* output,
-                                         int batch,
-                                         int in_heads,
-                                         int repeat_factor,
-                                         int head_dim) {
-    int out_heads = in_heads * repeat_factor;
+__global__ void pack_cache_interleaved_to_heads_kernel(const T* src_interleaved,
+                                                       T* dst_heads_major,
+                                                       int total_len,
+                                                       int num_heads_kv,
+                                                       int head_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch * out_heads * head_dim;
+    int total = total_len * num_heads_kv * head_dim;
     if (idx >= total) {
         return;
     }
     int d = idx % head_dim;
-    int out_h = (idx / head_dim) % out_heads;
-    int b = idx / (head_dim * out_heads);
-    int in_h = out_h / repeat_factor;
-    int in_idx = (b * in_heads + in_h) * head_dim + d;
-    output[idx] = input[in_idx];
+    int t = (idx / head_dim) % total_len;
+    int h = idx / (head_dim * total_len);
+    int src_idx = ((t * num_heads_kv + h) * head_dim) + d;
+    int dst_idx = ((h * total_len + t) * head_dim) + d;
+    dst_heads_major[dst_idx] = src_interleaved[src_idx];
 }
 
 template <typename T>
@@ -792,53 +785,45 @@ template <typename Traits>
 void append_sample_cache(SampleCache& sample,
                          const void* k_slice,
                          const void* v_slice,
-                         int num_heads,
+                         int num_heads_kv,
                          int seq_len,
                          int head_dim,
                          cudaStream_t stream) {
+    using DeviceType = typename Traits::DeviceType;
+    constexpr int kThreads = 256;
     const size_t elem_bytes = Traits::kElementBytes;
     const int old_len = sample.len;
     const int new_len = old_len + seq_len;
-    const size_t old_head_bytes = static_cast<size_t>(old_len) * head_dim * elem_bytes;
-    const size_t append_head_bytes = static_cast<size_t>(seq_len) * head_dim * elem_bytes;
+    const size_t row_elems = static_cast<size_t>(num_heads_kv) * head_dim;
     if (new_len > sample.capacity_len) {
         const int new_capacity = next_capacity_len(sample.capacity_len, new_len);
-        const size_t old_stride_bytes = static_cast<size_t>(sample.capacity_len) * head_dim * elem_bytes;
-        const size_t new_stride_bytes = static_cast<size_t>(new_capacity) * head_dim * elem_bytes;
-        const size_t total_new_bytes = static_cast<size_t>(num_heads) * new_stride_bytes;
+        const size_t total_new_bytes = static_cast<size_t>(new_capacity) * row_elems * elem_bytes;
 
         DeviceBuffer new_k(total_new_bytes);
         DeviceBuffer new_v(total_new_bytes);
-        for (int h = 0; h < num_heads; ++h) {
-            char* dst_k_head = static_cast<char*>(new_k.data()) + static_cast<size_t>(h) * new_stride_bytes;
-            char* dst_v_head = static_cast<char*>(new_v.data()) + static_cast<size_t>(h) * new_stride_bytes;
-            if (old_len > 0) {
-                const char* src_k_head = static_cast<const char*>(sample.k.data()) + static_cast<size_t>(h) * old_stride_bytes;
-                const char* src_v_head = static_cast<const char*>(sample.v.data()) + static_cast<size_t>(h) * old_stride_bytes;
-                cuda_check(cudaMemcpyAsync(dst_k_head, src_k_head, old_head_bytes, cudaMemcpyDeviceToDevice, stream),
-                           "cudaMemcpyAsync cache k old");
-                cuda_check(cudaMemcpyAsync(dst_v_head, src_v_head, old_head_bytes, cudaMemcpyDeviceToDevice, stream),
-                           "cudaMemcpyAsync cache v old");
-            }
+        if (old_len > 0) {
+            const size_t old_copy_bytes = static_cast<size_t>(old_len) * row_elems * elem_bytes;
+            cuda_check(cudaMemcpyAsync(new_k.data(), sample.k.data(), old_copy_bytes, cudaMemcpyDeviceToDevice, stream),
+                       "cudaMemcpyAsync cache k old");
+            cuda_check(cudaMemcpyAsync(new_v.data(), sample.v.data(), old_copy_bytes, cudaMemcpyDeviceToDevice, stream),
+                       "cudaMemcpyAsync cache v old");
         }
         sample.k = std::move(new_k);
         sample.v = std::move(new_v);
         sample.capacity_len = new_capacity;
     }
 
-    const size_t sample_stride_bytes = static_cast<size_t>(sample.capacity_len) * head_dim * elem_bytes;
-    for (int h = 0; h < num_heads; ++h) {
-        char* dst_k_head = static_cast<char*>(sample.k.data()) + static_cast<size_t>(h) * sample_stride_bytes;
-        char* dst_v_head = static_cast<char*>(sample.v.data()) + static_cast<size_t>(h) * sample_stride_bytes;
-        const char* src_k_append = static_cast<const char*>(k_slice) + static_cast<size_t>(h) * append_head_bytes;
-        const char* src_v_append = static_cast<const char*>(v_slice) + static_cast<size_t>(h) * append_head_bytes;
-        cuda_check(cudaMemcpyAsync(dst_k_head + old_head_bytes, src_k_append, append_head_bytes,
-                                   cudaMemcpyDeviceToDevice, stream),
-                   "cudaMemcpyAsync cache k append");
-        cuda_check(cudaMemcpyAsync(dst_v_head + old_head_bytes, src_v_append, append_head_bytes,
-                                   cudaMemcpyDeviceToDevice, stream),
-                   "cudaMemcpyAsync cache v append");
-    }
+    const int append_total = seq_len * num_heads_kv * head_dim;
+    const int append_blocks = (append_total + kThreads - 1) / kThreads;
+    append_kv_interleaved_kernel<DeviceType><<<append_blocks, kThreads, 0, stream>>>(
+        static_cast<const DeviceType*>(k_slice),
+        static_cast<DeviceType*>(sample.k.data()),
+        old_len, seq_len, num_heads_kv, head_dim);
+    append_kv_interleaved_kernel<DeviceType><<<append_blocks, kThreads, 0, stream>>>(
+        static_cast<const DeviceType*>(v_slice),
+        static_cast<DeviceType*>(sample.v.data()),
+        old_len, seq_len, num_heads_kv, head_dim);
+    cuda_check(cudaGetLastError(), "append_kv_interleaved_kernel");
     sample.len = new_len;
 }
 
@@ -847,13 +832,13 @@ int append_kv_cache(SelfAttnCudaState::Impl& impl,
                     const std::vector<int>& sample_ids,
                     int batch,
                     int seq_len,
-                    int num_heads,
+                    int num_heads_kv,
                     int head_dim,
-                    const DeviceBuffer& d_k_repeat,
-                    const DeviceBuffer& d_v_repeat,
+                    const DeviceBuffer& d_k,
+                    const DeviceBuffer& d_v,
                     cudaStream_t stream) {
     const size_t elem_bytes = Traits::kElementBytes;
-    const size_t sample_bytes = static_cast<size_t>(num_heads) * seq_len * head_dim * elem_bytes;
+    const size_t sample_bytes = static_cast<size_t>(num_heads_kv) * seq_len * head_dim * elem_bytes;
     for (int i = 0; i < batch; ++i) {
         int sample_id = sample_ids[i];
         if (sample_id < 0) {
@@ -861,9 +846,9 @@ int append_kv_cache(SelfAttnCudaState::Impl& impl,
         }
         ensure_sample_capacity(impl, sample_id + 1);
         SampleCache& sample = impl.samples[sample_id];
-        const char* k_slice = static_cast<const char*>(d_k_repeat.data()) + static_cast<size_t>(i) * sample_bytes;
-        const char* v_slice = static_cast<const char*>(d_v_repeat.data()) + static_cast<size_t>(i) * sample_bytes;
-        append_sample_cache<Traits>(sample, k_slice, v_slice, num_heads, seq_len, head_dim, stream);
+        const char* k_slice = static_cast<const char*>(d_k.data()) + static_cast<size_t>(i) * sample_bytes;
+        const char* v_slice = static_cast<const char*>(d_v.data()) + static_cast<size_t>(i) * sample_bytes;
+        append_sample_cache<Traits>(sample, k_slice, v_slice, num_heads_kv, seq_len, head_dim, stream);
     }
     int total_len = 0;
     if (!sample_ids.empty()) {
@@ -883,98 +868,107 @@ int append_kv_cache(SelfAttnCudaState::Impl& impl,
 template <typename Traits>
 void build_cache_batch(const SelfAttnCudaState::Impl& impl,
                        const std::vector<int>& sample_ids,
-                       int num_heads,
+                       int num_heads_kv,
                        int total_len,
                        int head_dim,
                        DeviceBuffer& d_cache_k_batch,
                        DeviceBuffer& d_cache_v_batch,
                        cudaStream_t stream) {
+    using DeviceType = typename Traits::DeviceType;
+    constexpr int kThreads = 256;
     const size_t elem_bytes = Traits::kElementBytes;
     const int batch = static_cast<int>(sample_ids.size());
-    const size_t sample_bytes = static_cast<size_t>(num_heads) * total_len * head_dim * elem_bytes;
+    const size_t sample_bytes = static_cast<size_t>(num_heads_kv) * total_len * head_dim * elem_bytes;
     ensure_device_buffer(d_cache_k_batch, sample_bytes * batch);
     ensure_device_buffer(d_cache_v_batch, sample_bytes * batch);
-    const size_t compact_head_bytes = static_cast<size_t>(total_len) * head_dim * elem_bytes;
+    const int pack_total = total_len * num_heads_kv * head_dim;
+    const int pack_blocks = (pack_total + kThreads - 1) / kThreads;
     for (int i = 0; i < batch; ++i) {
         int sample_id = sample_ids[i];
         const SampleCache& sample = impl.samples[sample_id];
         if (sample.len != total_len) {
             throw std::invalid_argument("Cache length mismatch while building batch cache.");
         }
-        const size_t sample_head_stride = static_cast<size_t>(sample.capacity_len) * head_dim * elem_bytes;
-        for (int h = 0; h < num_heads; ++h) {
-            const char* src_k_head = static_cast<const char*>(sample.k.data()) + static_cast<size_t>(h) * sample_head_stride;
-            const char* src_v_head = static_cast<const char*>(sample.v.data()) + static_cast<size_t>(h) * sample_head_stride;
-            char* dst_k_head = static_cast<char*>(d_cache_k_batch.data()) + static_cast<size_t>(i) * sample_bytes + static_cast<size_t>(h) * compact_head_bytes;
-            char* dst_v_head = static_cast<char*>(d_cache_v_batch.data()) + static_cast<size_t>(i) * sample_bytes + static_cast<size_t>(h) * compact_head_bytes;
-            cuda_check(cudaMemcpyAsync(dst_k_head, src_k_head, compact_head_bytes, cudaMemcpyDeviceToDevice, stream),
-                       "cudaMemcpyAsync cache k batch");
-            cuda_check(cudaMemcpyAsync(dst_v_head, src_v_head, compact_head_bytes, cudaMemcpyDeviceToDevice, stream),
-                       "cudaMemcpyAsync cache v batch");
-        }
+        char* dst_k = static_cast<char*>(d_cache_k_batch.data()) + static_cast<size_t>(i) * sample_bytes;
+        char* dst_v = static_cast<char*>(d_cache_v_batch.data()) + static_cast<size_t>(i) * sample_bytes;
+        pack_cache_interleaved_to_heads_kernel<DeviceType><<<pack_blocks, kThreads, 0, stream>>>(
+            static_cast<const DeviceType*>(sample.k.data()),
+            reinterpret_cast<DeviceType*>(dst_k),
+            total_len, num_heads_kv, head_dim);
+        pack_cache_interleaved_to_heads_kernel<DeviceType><<<pack_blocks, kThreads, 0, stream>>>(
+            static_cast<const DeviceType*>(sample.v.data()),
+            reinterpret_cast<DeviceType*>(dst_v),
+            total_len, num_heads_kv, head_dim);
     }
+    cuda_check(cudaGetLastError(), "pack_cache_interleaved_to_heads_kernel");
 }
 
 template <typename Traits>
-void launch_qk_batched_gemm(cublasHandle_t handle,
-                            const void* d_cache_k,
-                            const void* d_q,
-                            void* d_scores,
-                            int batch,
-                            int num_heads,
-                            int seq_len,
-                            int total_len,
-                            int head_dim,
-                            long long cache_head_stride_elems) {
-    const int batch_count = batch * num_heads;
-    const long long stride_a = cache_head_stride_elems;
-    const long long stride_b = static_cast<long long>(seq_len) * head_dim;
-    const long long stride_c = static_cast<long long>(seq_len) * total_len;
+void launch_qk_grouped_batched_gemm(cublasHandle_t handle,
+                                    const void* d_cache_k,
+                                    const void* d_q,
+                                    void* d_scores,
+                                    int batch,
+                                    int num_heads_kv,
+                                    int repeat_factor,
+                                    int seq_len,
+                                    int total_len,
+                                    int head_dim,
+                                    int cache_leading_dim,
+                                    long long cache_instance_stride_elems) {
+    const int grouped_seq = seq_len * repeat_factor;
+    const int batch_count = batch * num_heads_kv;
+    const long long stride_a = cache_instance_stride_elems;
+    const long long stride_b = static_cast<long long>(grouped_seq) * head_dim;
+    const long long stride_c = static_cast<long long>(grouped_seq) * total_len;
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublas_check(
         cublasGemmStridedBatchedEx(handle,
                                    CUBLAS_OP_T, CUBLAS_OP_N,
-                                   total_len, seq_len, head_dim,
+                                   total_len, grouped_seq, head_dim,
                                    &alpha,
-                                   d_cache_k, Traits::kCudaType, head_dim, stride_a,
+                                   d_cache_k, Traits::kCudaType, cache_leading_dim, stride_a,
                                    d_q, Traits::kCudaType, head_dim, stride_b,
                                    &beta,
                                    d_scores, Traits::kCudaType, total_len, stride_c,
                                    batch_count, Traits::kComputeType,
                                    CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-        "cublasGemmStridedBatchedEx qk");
+        "cublasGemmStridedBatchedEx qk grouped");
 }
 
 template <typename Traits>
-void launch_av_batched_gemm(cublasHandle_t handle,
-                            const void* d_scores,
-                            const void* d_cache_v,
-                            void* d_context,
-                            int batch,
-                            int num_heads,
-                            int seq_len,
-                            int total_len,
-                            int head_dim,
-                            long long cache_head_stride_elems) {
-    const int batch_count = batch * num_heads;
-    const long long stride_a = cache_head_stride_elems;
-    const long long stride_b = static_cast<long long>(seq_len) * total_len;
-    const long long stride_c = static_cast<long long>(seq_len) * head_dim;
+void launch_av_grouped_batched_gemm(cublasHandle_t handle,
+                                    const void* d_scores,
+                                    const void* d_cache_v,
+                                    void* d_context,
+                                    int batch,
+                                    int num_heads_kv,
+                                    int repeat_factor,
+                                    int seq_len,
+                                    int total_len,
+                                    int head_dim,
+                                    int cache_leading_dim,
+                                    long long cache_instance_stride_elems) {
+    const int grouped_seq = seq_len * repeat_factor;
+    const int batch_count = batch * num_heads_kv;
+    const long long stride_a = cache_instance_stride_elems;
+    const long long stride_b = static_cast<long long>(grouped_seq) * total_len;
+    const long long stride_c = static_cast<long long>(grouped_seq) * head_dim;
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublas_check(
         cublasGemmStridedBatchedEx(handle,
                                    CUBLAS_OP_N, CUBLAS_OP_N,
-                                   head_dim, seq_len, total_len,
+                                   head_dim, grouped_seq, total_len,
                                    &alpha,
-                                   d_cache_v, Traits::kCudaType, head_dim, stride_a,
+                                   d_cache_v, Traits::kCudaType, cache_leading_dim, stride_a,
                                    d_scores, Traits::kCudaType, total_len, stride_b,
                                    &beta,
                                    d_context, Traits::kCudaType, head_dim, stride_c,
                                    batch_count, Traits::kComputeType,
                                    CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-        "cublasGemmStridedBatchedEx av");
+        "cublasGemmStridedBatchedEx av grouped");
 }
 
 bool can_reuse_decode_graph(const DecodeGraphCache& graph,
@@ -1334,22 +1328,8 @@ Tensor self_attn_forward_cuda(const Tensor& input,
             batch, params.num_heads_kv, params.head_dim, params.rope_theta);
         cuda_check(cudaGetLastError(), "rope_seq1_kernel");
 
-        ensure_device_buffer(scratch.k_repeat, static_cast<size_t>(batch) * params.num_heads * params.head_dim * Traits::kElementBytes, scratch_realloc_counter);
-        ensure_device_buffer(scratch.v_repeat, static_cast<size_t>(batch) * params.num_heads * params.head_dim * Traits::kElementBytes, scratch_realloc_counter);
-        const int repeat_total = batch * params.num_heads * params.head_dim;
-        const int repeat_blocks = (repeat_total + kThreads - 1) / kThreads;
-        repeat_heads_seq1_kernel<DeviceType><<<repeat_blocks, kThreads, 0, stream>>>(
-            static_cast<const DeviceType*>(scratch.k.data()),
-            static_cast<DeviceType*>(scratch.k_repeat.data()),
-            batch, params.num_heads_kv, repeat_factor, params.head_dim);
-        repeat_heads_seq1_kernel<DeviceType><<<repeat_blocks, kThreads, 0, stream>>>(
-            static_cast<const DeviceType*>(scratch.v.data()),
-            static_cast<DeviceType*>(scratch.v_repeat.data()),
-            batch, params.num_heads_kv, repeat_factor, params.head_dim);
-        cuda_check(cudaGetLastError(), "repeat_heads_seq1_kernel");
-
-        int total_len = append_kv_cache<Traits>(*state.impl_, sample_ids, batch, seq_len, params.num_heads,
-                                                params.head_dim, scratch.k_repeat, scratch.v_repeat, stream);
+        int total_len = append_kv_cache<Traits>(*state.impl_, sample_ids, batch, seq_len, params.num_heads_kv,
+                                                params.head_dim, scratch.k, scratch.v, stream);
         if (total_len <= 0) {
             throw std::runtime_error("self_attn_forward_cuda: cache length is zero after append.");
         }
@@ -1357,7 +1337,8 @@ Tensor self_attn_forward_cuda(const Tensor& input,
         const void* cache_k_ptr = nullptr;
         const void* cache_v_ptr = nullptr;
         int score_capacity = total_len;
-        long long cache_head_stride_elems = static_cast<long long>(total_len) * params.head_dim;
+        int cache_leading_dim = params.head_dim;
+        long long cache_instance_stride_elems = static_cast<long long>(total_len) * params.head_dim;
         if (batch == 1) {
             const SampleCache& single = state.impl_->samples[sample_ids[0]];
             if (single.len != total_len) {
@@ -1366,9 +1347,10 @@ Tensor self_attn_forward_cuda(const Tensor& input,
             cache_k_ptr = single.k.data();
             cache_v_ptr = single.v.data();
             score_capacity = std::max(single.capacity_len, total_len);
-            cache_head_stride_elems = static_cast<long long>(score_capacity) * params.head_dim;
+            cache_leading_dim = params.num_heads_kv * params.head_dim;
+            cache_instance_stride_elems = params.head_dim;
         } else {
-            build_cache_batch<Traits>(*state.impl_, sample_ids, params.num_heads, total_len, params.head_dim,
+            build_cache_batch<Traits>(*state.impl_, sample_ids, params.num_heads_kv, total_len, params.head_dim,
                                       scratch.cache_k_batch, scratch.cache_v_batch, stream);
             cache_k_ptr = scratch.cache_k_batch.data();
             cache_v_ptr = scratch.cache_v_batch.data();
@@ -1402,9 +1384,9 @@ Tensor self_attn_forward_cuda(const Tensor& input,
         }
 
         auto launch_decode_seq1_pipeline = [&]() {
-            launch_qk_batched_gemm<Traits>(handle, cache_k_ptr, scratch.q.data(), scratch.scores.data(),
-                                           batch, params.num_heads, 1, score_capacity, params.head_dim,
-                                           cache_head_stride_elems);
+            launch_qk_grouped_batched_gemm<Traits>(handle, cache_k_ptr, scratch.q.data(), scratch.scores.data(),
+                                                   batch, params.num_heads_kv, repeat_factor, 1, score_capacity,
+                                                   params.head_dim, cache_leading_dim, cache_instance_stride_elems);
 
             const int decode_rows = batch * params.num_heads;
             const float score_scale = 1.0f / std::sqrt(static_cast<float>(params.head_dim));
@@ -1416,9 +1398,9 @@ Tensor self_attn_forward_cuda(const Tensor& input,
                 batch, params.num_heads, score_capacity, d_active_len, score_scale);
             cuda_check(cudaGetLastError(), "mask_scale_softmax_decode_kernel");
 
-            launch_av_batched_gemm<Traits>(handle, scratch.scores.data(), cache_v_ptr, scratch.context.data(),
-                                           batch, params.num_heads, 1, score_capacity, params.head_dim,
-                                           cache_head_stride_elems);
+            launch_av_grouped_batched_gemm<Traits>(handle, scratch.scores.data(), cache_v_ptr, scratch.context.data(),
+                                                   batch, params.num_heads_kv, repeat_factor, 1, score_capacity,
+                                                   params.head_dim, cache_leading_dim, cache_instance_stride_elems);
 
             const int merge_total = rows * hidden_dim;
             const int merge_blocks = (merge_total + kThreads - 1) / kThreads;
@@ -1565,29 +1547,16 @@ Tensor self_attn_forward_cuda(const Tensor& input,
         batch, params.num_heads_kv, seq_len, params.head_dim, params.rope_theta);
     cuda_check(cudaGetLastError(), "rope_kernel");
 
-    ensure_device_buffer(scratch.k_repeat, static_cast<size_t>(batch) * params.num_heads * seq_len * params.head_dim * Traits::kElementBytes, scratch_realloc_counter);
-    ensure_device_buffer(scratch.v_repeat, static_cast<size_t>(batch) * params.num_heads * seq_len * params.head_dim * Traits::kElementBytes, scratch_realloc_counter);
-    int repeat_total = batch * params.num_heads * seq_len * params.head_dim;
-    int repeat_blocks = (repeat_total + kThreads - 1) / kThreads;
-    repeat_heads_kernel<DeviceType><<<repeat_blocks, kThreads, 0, stream>>>(
-        static_cast<const DeviceType*>(scratch.k.data()),
-        static_cast<DeviceType*>(scratch.k_repeat.data()),
-        batch, params.num_heads_kv, repeat_factor, seq_len, params.head_dim);
-    repeat_heads_kernel<DeviceType><<<repeat_blocks, kThreads, 0, stream>>>(
-        static_cast<const DeviceType*>(scratch.v.data()),
-        static_cast<DeviceType*>(scratch.v_repeat.data()),
-        batch, params.num_heads_kv, repeat_factor, seq_len, params.head_dim);
-    cuda_check(cudaGetLastError(), "repeat_heads_kernel");
-
-    int total_len = append_kv_cache<Traits>(*state.impl_, sample_ids, batch, seq_len, params.num_heads,
-                                            params.head_dim, scratch.k_repeat, scratch.v_repeat, stream);
+    int total_len = append_kv_cache<Traits>(*state.impl_, sample_ids, batch, seq_len, params.num_heads_kv,
+                                            params.head_dim, scratch.k, scratch.v, stream);
     if (total_len <= 0) {
         throw std::runtime_error("self_attn_forward_cuda: cache length is zero after append.");
     }
 
     const void* cache_k_ptr = nullptr;
     const void* cache_v_ptr = nullptr;
-    long long cache_head_stride_elems = static_cast<long long>(total_len) * params.head_dim;
+    int cache_leading_dim = params.head_dim;
+    long long cache_instance_stride_elems = static_cast<long long>(total_len) * params.head_dim;
     if (batch == 1) {
         const SampleCache& single = state.impl_->samples[sample_ids[0]];
         if (single.len != total_len) {
@@ -1595,18 +1564,19 @@ Tensor self_attn_forward_cuda(const Tensor& input,
         }
         cache_k_ptr = single.k.data();
         cache_v_ptr = single.v.data();
-        cache_head_stride_elems = static_cast<long long>(single.capacity_len) * params.head_dim;
+        cache_leading_dim = params.num_heads_kv * params.head_dim;
+        cache_instance_stride_elems = params.head_dim;
     } else {
-        build_cache_batch<Traits>(*state.impl_, sample_ids, params.num_heads, total_len, params.head_dim,
+        build_cache_batch<Traits>(*state.impl_, sample_ids, params.num_heads_kv, total_len, params.head_dim,
                                   scratch.cache_k_batch, scratch.cache_v_batch, stream);
         cache_k_ptr = scratch.cache_k_batch.data();
         cache_v_ptr = scratch.cache_v_batch.data();
     }
 
     ensure_device_buffer(scratch.scores, static_cast<size_t>(batch) * params.num_heads * seq_len * total_len * Traits::kElementBytes, scratch_realloc_counter);
-    launch_qk_batched_gemm<Traits>(handle, cache_k_ptr, scratch.q.data(), scratch.scores.data(),
-                                   batch, params.num_heads, seq_len, total_len, params.head_dim,
-                                   cache_head_stride_elems);
+    launch_qk_grouped_batched_gemm<Traits>(handle, cache_k_ptr, scratch.q.data(), scratch.scores.data(),
+                                           batch, params.num_heads_kv, repeat_factor, seq_len, total_len, params.head_dim,
+                                           cache_leading_dim, cache_instance_stride_elems);
 
     const int* d_sample_ids = nullptr;
     const int* d_pad_ptr = nullptr;
@@ -1636,9 +1606,9 @@ Tensor self_attn_forward_cuda(const Tensor& input,
     cuda_check(cudaGetLastError(), "mask_scale_softmax_kernel");
 
     ensure_device_buffer(scratch.context, static_cast<size_t>(batch) * params.num_heads * seq_len * params.head_dim * Traits::kElementBytes, scratch_realloc_counter);
-    launch_av_batched_gemm<Traits>(handle, scratch.scores.data(), cache_v_ptr, scratch.context.data(),
-                                   batch, params.num_heads, seq_len, total_len, params.head_dim,
-                                   cache_head_stride_elems);
+    launch_av_grouped_batched_gemm<Traits>(handle, scratch.scores.data(), cache_v_ptr, scratch.context.data(),
+                                           batch, params.num_heads_kv, repeat_factor, seq_len, total_len, params.head_dim,
+                                           cache_leading_dim, cache_instance_stride_elems);
 
     ensure_device_buffer(scratch.merged, static_cast<size_t>(rows) * hidden_dim * Traits::kElementBytes, scratch_realloc_counter);
     int merge_total = rows * hidden_dim;

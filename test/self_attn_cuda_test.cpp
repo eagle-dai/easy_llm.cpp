@@ -371,7 +371,9 @@ int main() {
               << ", pad_lens_uploads=" << perf_stats.pad_lens_uploads
               << ", decode_seq1_path_hits=" << perf_stats.decode_seq1_path_hits
               << ", decode_graph_captures=" << perf_stats.decode_graph_captures
-              << ", decode_graph_launches=" << perf_stats.decode_graph_launches << "\n";
+              << ", decode_graph_launches=" << perf_stats.decode_graph_launches
+              << ", repeat_head_materializations=" << perf_stats.repeat_head_materializations
+              << ", kv_cache_head_memcpy_ops=" << perf_stats.kv_cache_head_memcpy_ops << "\n";
     if (perf_stats.scratch_reallocations > 40) {
         std::cerr << "FAIL: scratch reallocations too high in decode loop\n";
         return 1;
@@ -390,6 +392,14 @@ int main() {
     }
     if (perf_stats.decode_graph_launches < perf_stats.decode_graph_captures) {
         std::cerr << "FAIL: decode graph launches must be >= captures\n";
+        return 1;
+    }
+    if (perf_stats.repeat_head_materializations != 0) {
+        std::cerr << "FAIL: repeat_heads materialization should be eliminated\n";
+        return 1;
+    }
+    if (perf_stats.kv_cache_head_memcpy_ops != 0) {
+        std::cerr << "FAIL: per-head KV cache memcpy should be eliminated\n";
         return 1;
     }
 
