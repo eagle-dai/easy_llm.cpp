@@ -62,6 +62,75 @@ struct ForwardScratchBuffers {
     DeviceBuffer context;
     DeviceBuffer merged;
     DeviceBuffer output;
+    DeviceBuffer decode_active_len;
+};
+
+struct DecodeGraphCache {
+    cudaGraph_t graph{nullptr};
+    cudaGraphExec_t exec{nullptr};
+    int batch{0};
+    int sample_id{-1};
+    int num_heads{0};
+    int head_dim{0};
+    int hidden_dim{0};
+    int q_out_dim{0};
+    int k_out_dim{0};
+    int v_out_dim{0};
+    int o_out_dim{0};
+    int repeat_factor{0};
+    int score_capacity{0};
+    int pad_size{0};
+    const void* cache_k_ptr{nullptr};
+    const void* cache_v_ptr{nullptr};
+    const int* d_pad_ptr{nullptr};
+    const void* d_norm_weight_ptr{nullptr};
+    const void* q_weight_ptr{nullptr};
+    const void* k_weight_ptr{nullptr};
+    const void* v_weight_ptr{nullptr};
+    const void* o_weight_ptr{nullptr};
+    const void* d_q_bias_ptr{nullptr};
+    const void* d_k_bias_ptr{nullptr};
+    const void* d_v_bias_ptr{nullptr};
+    const void* d_o_bias_ptr{nullptr};
+
+    void reset() {
+        if (exec != nullptr) {
+            cudaGraphExecDestroy(exec);
+            exec = nullptr;
+        }
+        if (graph != nullptr) {
+            cudaGraphDestroy(graph);
+            graph = nullptr;
+        }
+        batch = 0;
+        sample_id = -1;
+        num_heads = 0;
+        head_dim = 0;
+        hidden_dim = 0;
+        q_out_dim = 0;
+        k_out_dim = 0;
+        v_out_dim = 0;
+        o_out_dim = 0;
+        repeat_factor = 0;
+        score_capacity = 0;
+        pad_size = 0;
+        cache_k_ptr = nullptr;
+        cache_v_ptr = nullptr;
+        d_pad_ptr = nullptr;
+        d_norm_weight_ptr = nullptr;
+        q_weight_ptr = nullptr;
+        k_weight_ptr = nullptr;
+        v_weight_ptr = nullptr;
+        o_weight_ptr = nullptr;
+        d_q_bias_ptr = nullptr;
+        d_k_bias_ptr = nullptr;
+        d_v_bias_ptr = nullptr;
+        d_o_bias_ptr = nullptr;
+    }
+
+    ~DecodeGraphCache() {
+        reset();
+    }
 };
 
 struct SelfAttnCudaState::Impl {
@@ -75,6 +144,7 @@ struct SelfAttnCudaState::Impl {
     TensorUploadCache v_bias_cache;
     TensorUploadCache o_bias_cache;
     IntVectorUploadCache pad_lens_cache;
+    DecodeGraphCache decode_graph;
     SelfAttnCudaStats stats;
 };
 
@@ -183,6 +253,25 @@ __global__ void split_transpose_kernel(const T* input,
 }
 
 template <typename T>
+__global__ void split_transpose_seq1_kernel(const T* input,
+                                            T* output,
+                                            int batch,
+                                            int num_heads,
+                                            int head_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * num_heads * head_dim;
+    if (idx >= total) {
+        return;
+    }
+    int d = idx % head_dim;
+    int h = (idx / head_dim) % num_heads;
+    int b = idx / (head_dim * num_heads);
+    int hidden_dim = num_heads * head_dim;
+    int in_idx = b * hidden_dim + h * head_dim + d;
+    output[idx] = input[in_idx];
+}
+
+template <typename T>
 __global__ void repeat_heads_kernel(const T* input,
                                     T* output,
                                     int batch,
@@ -202,6 +291,27 @@ __global__ void repeat_heads_kernel(const T* input,
     int b = idx / (head_dim * seq_len * out_heads);
     int in_h = out_h / repeat_factor;
     int in_idx = (((b * in_heads + in_h) * seq_len + s) * head_dim) + d;
+    output[idx] = input[in_idx];
+}
+
+template <typename T>
+__global__ void repeat_heads_seq1_kernel(const T* input,
+                                         T* output,
+                                         int batch,
+                                         int in_heads,
+                                         int repeat_factor,
+                                         int head_dim) {
+    int out_heads = in_heads * repeat_factor;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * out_heads * head_dim;
+    if (idx >= total) {
+        return;
+    }
+    int d = idx % head_dim;
+    int out_h = (idx / head_dim) % out_heads;
+    int b = idx / (head_dim * out_heads);
+    int in_h = out_h / repeat_factor;
+    int in_idx = (b * in_heads + in_h) * head_dim + d;
     output[idx] = input[in_idx];
 }
 
@@ -231,6 +341,36 @@ __global__ void rope_kernel(T* input,
     float x2 = to_float(input[idx2]);
     float freq = powf(rope_theta, (2.0f * static_cast<float>(k)) / static_cast<float>(head_dim));
     float angle = static_cast<float>(s + offsets[b]) / freq;
+    float cos_v = cosf(angle);
+    float sin_v = sinf(angle);
+    input[idx1] = from_float<T>(x1 * cos_v - x2 * sin_v);
+    input[idx2] = from_float<T>(x1 * sin_v + x2 * cos_v);
+}
+
+template <typename T>
+__global__ void rope_seq1_kernel(T* input,
+                                 const int* offsets,
+                                 int batch,
+                                 int num_heads,
+                                 int head_dim,
+                                 float rope_theta) {
+    int half_dim = head_dim / 2;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * num_heads * half_dim;
+    if (idx >= total) {
+        return;
+    }
+    int k = idx % half_dim;
+    int h = (idx / half_dim) % num_heads;
+    int b = idx / (half_dim * num_heads);
+
+    int base = (b * num_heads + h) * head_dim;
+    int idx1 = base + k;
+    int idx2 = idx1 + half_dim;
+    float x1 = to_float(input[idx1]);
+    float x2 = to_float(input[idx2]);
+    float freq = powf(rope_theta, (2.0f * static_cast<float>(k)) / static_cast<float>(head_dim));
+    float angle = static_cast<float>(offsets[b]) / freq;
     float cos_v = cosf(angle);
     float sin_v = sinf(angle);
     input[idx1] = from_float<T>(x1 * cos_v - x2 * sin_v);
@@ -325,6 +465,99 @@ __global__ void mask_scale_softmax_kernel(T* scores,
     }
     float denom = fmaxf(shared[0], FLT_EPSILON * 10.0f);
     for (int k = tid; k < total_len; k += blockDim.x) {
+        float p = to_float(scores[row_base + k]) / denom;
+        scores[row_base + k] = from_float<T>(p);
+    }
+}
+
+template <typename T>
+__global__ void mask_scale_softmax_decode_kernel(T* scores,
+                                                 const int* sample_ids,
+                                                 const int* pad_lens,
+                                                 int pad_lens_size,
+                                                 int batch,
+                                                 int heads,
+                                                 int score_len,
+                                                 const int* active_len_ptr,
+                                                 float scale) {
+    extern __shared__ float shared[];
+    int row = blockIdx.x;
+    int row_count = batch * heads;
+    if (row >= row_count) {
+        return;
+    }
+    int tid = threadIdx.x;
+
+    int b = row / heads;
+    int row_base = row * score_len;
+    int active_len = score_len;
+    if (active_len_ptr != nullptr) {
+        active_len = active_len_ptr[0];
+    }
+    if (active_len < 0) {
+        active_len = 0;
+    }
+    if (active_len > score_len) {
+        active_len = score_len;
+    }
+
+    int pad_len = 0;
+    if (pad_lens != nullptr && pad_lens_size > 0) {
+        int sample_id = sample_ids[b];
+        if (sample_id >= 0 && sample_id < pad_lens_size) {
+            pad_len = pad_lens[sample_id];
+            if (pad_len < 0) {
+                pad_len = 0;
+            }
+            if (pad_len > active_len) {
+                pad_len = active_len;
+            }
+        }
+    }
+
+    float local_max = -INFINITY;
+    for (int k = tid; k < score_len; k += blockDim.x) {
+        float v = to_float(scores[row_base + k]);
+        if (k >= active_len || (pad_len > 0 && k < pad_len)) {
+            v = -INFINITY;
+        }
+        v *= scale;
+        local_max = fmaxf(local_max, v);
+    }
+    shared[tid] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
+        }
+        __syncthreads();
+    }
+    float row_max = shared[0];
+
+    float local_sum = 0.0f;
+    for (int k = tid; k < score_len; k += blockDim.x) {
+        float v = to_float(scores[row_base + k]);
+        if (k >= active_len || (pad_len > 0 && k < pad_len)) {
+            v = -INFINITY;
+        }
+        v *= scale;
+        float exp_v = 0.0f;
+        if (isfinite(row_max)) {
+            exp_v = expf(v - row_max);
+        }
+        scores[row_base + k] = from_float<T>(exp_v);
+        local_sum += exp_v;
+    }
+    shared[tid] = local_sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        __syncthreads();
+    }
+    float denom = fmaxf(shared[0], FLT_EPSILON * 10.0f);
+    for (int k = tid; k < score_len; k += blockDim.x) {
         float p = to_float(scores[row_base + k]) / denom;
         scores[row_base + k] = from_float<T>(p);
     }
@@ -744,6 +977,109 @@ void launch_av_batched_gemm(cublasHandle_t handle,
         "cublasGemmStridedBatchedEx av");
 }
 
+bool can_reuse_decode_graph(const DecodeGraphCache& graph,
+                            int batch,
+                            int sample_id,
+                            int num_heads,
+                            int head_dim,
+                            int hidden_dim,
+                            int q_out_dim,
+                            int k_out_dim,
+                            int v_out_dim,
+                            int o_out_dim,
+                            int repeat_factor,
+                            int score_capacity,
+                            int pad_size,
+                            const void* cache_k_ptr,
+                            const void* cache_v_ptr,
+                            const int* d_pad_ptr,
+                            const void* d_norm_weight,
+                            const void* q_weight_ptr,
+                            const void* k_weight_ptr,
+                            const void* v_weight_ptr,
+                            const void* o_weight_ptr,
+                            const void* d_q_bias,
+                            const void* d_k_bias,
+                            const void* d_v_bias,
+                            const void* d_o_bias) {
+    return graph.exec != nullptr &&
+           graph.batch == batch &&
+           graph.sample_id == sample_id &&
+           graph.num_heads == num_heads &&
+           graph.head_dim == head_dim &&
+           graph.hidden_dim == hidden_dim &&
+           graph.q_out_dim == q_out_dim &&
+           graph.k_out_dim == k_out_dim &&
+           graph.v_out_dim == v_out_dim &&
+           graph.o_out_dim == o_out_dim &&
+           graph.repeat_factor == repeat_factor &&
+           graph.score_capacity == score_capacity &&
+           graph.pad_size == pad_size &&
+           graph.cache_k_ptr == cache_k_ptr &&
+           graph.cache_v_ptr == cache_v_ptr &&
+           graph.d_pad_ptr == d_pad_ptr &&
+           graph.d_norm_weight_ptr == d_norm_weight &&
+           graph.q_weight_ptr == q_weight_ptr &&
+           graph.k_weight_ptr == k_weight_ptr &&
+           graph.v_weight_ptr == v_weight_ptr &&
+           graph.o_weight_ptr == o_weight_ptr &&
+           graph.d_q_bias_ptr == d_q_bias &&
+           graph.d_k_bias_ptr == d_k_bias &&
+           graph.d_v_bias_ptr == d_v_bias &&
+           graph.d_o_bias_ptr == d_o_bias;
+}
+
+void fill_decode_graph_signature(DecodeGraphCache& graph,
+                                 int batch,
+                                 int sample_id,
+                                 int num_heads,
+                                 int head_dim,
+                                 int hidden_dim,
+                                 int q_out_dim,
+                                 int k_out_dim,
+                                 int v_out_dim,
+                                 int o_out_dim,
+                                 int repeat_factor,
+                                 int score_capacity,
+                                 int pad_size,
+                                 const void* cache_k_ptr,
+                                 const void* cache_v_ptr,
+                                 const int* d_pad_ptr,
+                                 const void* d_norm_weight,
+                                 const void* q_weight_ptr,
+                                 const void* k_weight_ptr,
+                                 const void* v_weight_ptr,
+                                 const void* o_weight_ptr,
+                                 const void* d_q_bias,
+                                 const void* d_k_bias,
+                                 const void* d_v_bias,
+                                 const void* d_o_bias) {
+    graph.batch = batch;
+    graph.sample_id = sample_id;
+    graph.num_heads = num_heads;
+    graph.head_dim = head_dim;
+    graph.hidden_dim = hidden_dim;
+    graph.q_out_dim = q_out_dim;
+    graph.k_out_dim = k_out_dim;
+    graph.v_out_dim = v_out_dim;
+    graph.o_out_dim = o_out_dim;
+    graph.repeat_factor = repeat_factor;
+    graph.score_capacity = score_capacity;
+    graph.pad_size = pad_size;
+    graph.cache_k_ptr = cache_k_ptr;
+    graph.cache_v_ptr = cache_v_ptr;
+    graph.d_pad_ptr = d_pad_ptr;
+    graph.d_norm_weight_ptr = d_norm_weight;
+    graph.q_weight_ptr = q_weight_ptr;
+    graph.k_weight_ptr = k_weight_ptr;
+    graph.v_weight_ptr = v_weight_ptr;
+    graph.o_weight_ptr = o_weight_ptr;
+    graph.d_q_bias_ptr = d_q_bias;
+    graph.d_k_bias_ptr = d_k_bias;
+    graph.d_v_bias_ptr = d_v_bias;
+    graph.d_o_bias_ptr = d_o_bias;
+}
+
 } // namespace
 
 SelfAttnCudaState::SelfAttnCudaState()
@@ -761,6 +1097,7 @@ void SelfAttnCudaState::init_kv_cache(int batch_size) {
     }
     impl_->samples.clear();
     impl_->samples.resize(batch_size);
+    impl_->decode_graph.reset();
 }
 
 void SelfAttnCudaState::clear_kv_cache(int sample_id) {
@@ -772,10 +1109,12 @@ void SelfAttnCudaState::clear_kv_cache(int sample_id) {
     sample.v = DeviceBuffer();
     sample.len = 0;
     sample.capacity_len = 0;
+    impl_->decode_graph.reset();
 }
 
 void SelfAttnCudaState::reset_kv_cache() {
     impl_->samples.clear();
+    impl_->decode_graph.reset();
 }
 
 int SelfAttnCudaState::cache_len(int sample_id) const {
@@ -945,6 +1284,241 @@ Tensor self_attn_forward_cuda(const Tensor& input,
     }
     if (o_bias.size() == o_out_dim) {
         d_o_bias = get_or_upload_tensor<Traits>(o_bias, state.impl_->o_bias_cache, stream, "cudaMemcpyAsync o_bias");
+    }
+
+    if (seq_len == 1) {
+        state.impl_->stats.decode_seq1_path_hits += 1;
+
+        maybe_add_bias<Traits>(stream, scratch.q_proj.data(), d_q_bias, rows, q_out_dim);
+        maybe_add_bias<Traits>(stream, scratch.k_proj.data(), d_k_bias, rows, k_out_dim);
+        maybe_add_bias<Traits>(stream, scratch.v_proj.data(), d_v_bias, rows, v_out_dim);
+
+        ensure_device_buffer(scratch.q, static_cast<size_t>(batch) * params.num_heads * params.head_dim * Traits::kElementBytes, scratch_realloc_counter);
+        ensure_device_buffer(scratch.k, static_cast<size_t>(batch) * params.num_heads_kv * params.head_dim * Traits::kElementBytes, scratch_realloc_counter);
+        ensure_device_buffer(scratch.v, static_cast<size_t>(batch) * params.num_heads_kv * params.head_dim * Traits::kElementBytes, scratch_realloc_counter);
+
+        const int q_total = batch * params.num_heads * params.head_dim;
+        const int kv_total = batch * params.num_heads_kv * params.head_dim;
+        const int q_blocks = (q_total + kThreads - 1) / kThreads;
+        const int kv_blocks = (kv_total + kThreads - 1) / kThreads;
+        split_transpose_seq1_kernel<DeviceType><<<q_blocks, kThreads, 0, stream>>>(
+            static_cast<const DeviceType*>(scratch.q_proj.data()),
+            static_cast<DeviceType*>(scratch.q.data()),
+            batch, params.num_heads, params.head_dim);
+        split_transpose_seq1_kernel<DeviceType><<<kv_blocks, kThreads, 0, stream>>>(
+            static_cast<const DeviceType*>(scratch.k_proj.data()),
+            static_cast<DeviceType*>(scratch.k.data()),
+            batch, params.num_heads_kv, params.head_dim);
+        split_transpose_seq1_kernel<DeviceType><<<kv_blocks, kThreads, 0, stream>>>(
+            static_cast<const DeviceType*>(scratch.v_proj.data()),
+            static_cast<DeviceType*>(scratch.v.data()),
+            batch, params.num_heads_kv, params.head_dim);
+        cuda_check(cudaGetLastError(), "split_transpose_seq1_kernel");
+
+        ensure_device_buffer(scratch.offsets, static_cast<size_t>(batch) * sizeof(int), scratch_realloc_counter);
+        cuda_check(cudaMemcpyAsync(scratch.offsets.data(), offsets.data(), static_cast<size_t>(batch) * sizeof(int),
+                                   cudaMemcpyHostToDevice, stream),
+                   "cudaMemcpyAsync offsets");
+
+        const int rope_q_total = batch * params.num_heads * (params.head_dim / 2);
+        const int rope_k_total = batch * params.num_heads_kv * (params.head_dim / 2);
+        const int rope_q_blocks = (rope_q_total + kThreads - 1) / kThreads;
+        const int rope_k_blocks = (rope_k_total + kThreads - 1) / kThreads;
+        rope_seq1_kernel<DeviceType><<<rope_q_blocks, kThreads, 0, stream>>>(
+            static_cast<DeviceType*>(scratch.q.data()),
+            static_cast<const int*>(scratch.offsets.data()),
+            batch, params.num_heads, params.head_dim, params.rope_theta);
+        rope_seq1_kernel<DeviceType><<<rope_k_blocks, kThreads, 0, stream>>>(
+            static_cast<DeviceType*>(scratch.k.data()),
+            static_cast<const int*>(scratch.offsets.data()),
+            batch, params.num_heads_kv, params.head_dim, params.rope_theta);
+        cuda_check(cudaGetLastError(), "rope_seq1_kernel");
+
+        ensure_device_buffer(scratch.k_repeat, static_cast<size_t>(batch) * params.num_heads * params.head_dim * Traits::kElementBytes, scratch_realloc_counter);
+        ensure_device_buffer(scratch.v_repeat, static_cast<size_t>(batch) * params.num_heads * params.head_dim * Traits::kElementBytes, scratch_realloc_counter);
+        const int repeat_total = batch * params.num_heads * params.head_dim;
+        const int repeat_blocks = (repeat_total + kThreads - 1) / kThreads;
+        repeat_heads_seq1_kernel<DeviceType><<<repeat_blocks, kThreads, 0, stream>>>(
+            static_cast<const DeviceType*>(scratch.k.data()),
+            static_cast<DeviceType*>(scratch.k_repeat.data()),
+            batch, params.num_heads_kv, repeat_factor, params.head_dim);
+        repeat_heads_seq1_kernel<DeviceType><<<repeat_blocks, kThreads, 0, stream>>>(
+            static_cast<const DeviceType*>(scratch.v.data()),
+            static_cast<DeviceType*>(scratch.v_repeat.data()),
+            batch, params.num_heads_kv, repeat_factor, params.head_dim);
+        cuda_check(cudaGetLastError(), "repeat_heads_seq1_kernel");
+
+        int total_len = append_kv_cache<Traits>(*state.impl_, sample_ids, batch, seq_len, params.num_heads,
+                                                params.head_dim, scratch.k_repeat, scratch.v_repeat, stream);
+        if (total_len <= 0) {
+            throw std::runtime_error("self_attn_forward_cuda: cache length is zero after append.");
+        }
+
+        const void* cache_k_ptr = nullptr;
+        const void* cache_v_ptr = nullptr;
+        int score_capacity = total_len;
+        long long cache_head_stride_elems = static_cast<long long>(total_len) * params.head_dim;
+        if (batch == 1) {
+            const SampleCache& single = state.impl_->samples[sample_ids[0]];
+            if (single.len != total_len) {
+                throw std::invalid_argument("self_attn_forward_cuda: cache length mismatch for batch=1.");
+            }
+            cache_k_ptr = single.k.data();
+            cache_v_ptr = single.v.data();
+            score_capacity = std::max(single.capacity_len, total_len);
+            cache_head_stride_elems = static_cast<long long>(score_capacity) * params.head_dim;
+        } else {
+            build_cache_batch<Traits>(*state.impl_, sample_ids, params.num_heads, total_len, params.head_dim,
+                                      scratch.cache_k_batch, scratch.cache_v_batch, stream);
+            cache_k_ptr = scratch.cache_k_batch.data();
+            cache_v_ptr = scratch.cache_v_batch.data();
+        }
+
+        ensure_device_buffer(scratch.scores, static_cast<size_t>(batch) * params.num_heads * score_capacity * Traits::kElementBytes, scratch_realloc_counter);
+        ensure_device_buffer(scratch.context, static_cast<size_t>(batch) * params.num_heads * params.head_dim * Traits::kElementBytes, scratch_realloc_counter);
+        ensure_device_buffer(scratch.merged, static_cast<size_t>(rows) * hidden_dim * Traits::kElementBytes, scratch_realloc_counter);
+        ensure_device_buffer(scratch.output, static_cast<size_t>(rows) * o_out_dim * Traits::kElementBytes, scratch_realloc_counter);
+        ensure_device_buffer(scratch.decode_active_len, sizeof(int), scratch_realloc_counter);
+        cuda_check(cudaMemcpyAsync(scratch.decode_active_len.data(), &total_len, sizeof(int),
+                                   cudaMemcpyHostToDevice, stream),
+                   "cudaMemcpyAsync decode_active_len");
+        const int* d_active_len = static_cast<const int*>(scratch.decode_active_len.data());
+
+        const int* d_sample_ids = nullptr;
+        const int* d_pad_ptr = nullptr;
+        int pad_size = static_cast<int>(pad_lens_by_sample.size());
+        if (pad_size > 0) {
+            ensure_device_buffer(scratch.sample_ids, static_cast<size_t>(batch) * sizeof(int), scratch_realloc_counter);
+            cuda_check(cudaMemcpyAsync(scratch.sample_ids.data(), sample_ids.data(), static_cast<size_t>(batch) * sizeof(int),
+                                       cudaMemcpyHostToDevice, stream),
+                       "cudaMemcpyAsync sample_ids");
+            d_sample_ids = static_cast<const int*>(scratch.sample_ids.data());
+            d_pad_ptr = get_or_upload_int_vector(
+                pad_lens_by_sample,
+                state.impl_->pad_lens_cache,
+                stream,
+                "cudaMemcpyAsync pad_lens",
+                &state.impl_->stats.pad_lens_uploads);
+        }
+
+        auto launch_decode_seq1_pipeline = [&]() {
+            launch_qk_batched_gemm<Traits>(handle, cache_k_ptr, scratch.q.data(), scratch.scores.data(),
+                                           batch, params.num_heads, 1, score_capacity, params.head_dim,
+                                           cache_head_stride_elems);
+
+            const int decode_rows = batch * params.num_heads;
+            const float score_scale = 1.0f / std::sqrt(static_cast<float>(params.head_dim));
+            mask_scale_softmax_decode_kernel<DeviceType><<<decode_rows, kThreads, kThreads * sizeof(float), stream>>>(
+                static_cast<DeviceType*>(scratch.scores.data()),
+                d_sample_ids,
+                d_pad_ptr,
+                pad_size,
+                batch, params.num_heads, score_capacity, d_active_len, score_scale);
+            cuda_check(cudaGetLastError(), "mask_scale_softmax_decode_kernel");
+
+            launch_av_batched_gemm<Traits>(handle, scratch.scores.data(), cache_v_ptr, scratch.context.data(),
+                                           batch, params.num_heads, 1, score_capacity, params.head_dim,
+                                           cache_head_stride_elems);
+
+            const int merge_total = rows * hidden_dim;
+            const int merge_blocks = (merge_total + kThreads - 1) / kThreads;
+            merge_heads_kernel<DeviceType><<<merge_blocks, kThreads, 0, stream>>>(
+                static_cast<const DeviceType*>(scratch.context.data()),
+                static_cast<DeviceType*>(scratch.merged.data()),
+                batch, 1, params.num_heads, params.head_dim);
+            cuda_check(cudaGetLastError(), "merge_heads_kernel decode_seq1");
+
+            launch_linear<Traits>(handle, o_weight_entry.device_ptr, scratch.merged.data(), scratch.output.data(), rows, hidden_dim, o_out_dim);
+            maybe_add_bias<Traits>(stream, scratch.output.data(), d_o_bias, rows, o_out_dim);
+        };
+
+        bool launched = false;
+        if (batch == 1) {
+            DecodeGraphCache& decode_graph = state.impl_->decode_graph;
+            const int sample_id = sample_ids[0];
+            const bool can_reuse = can_reuse_decode_graph(
+                decode_graph,
+                batch,
+                sample_id,
+                params.num_heads,
+                params.head_dim,
+                hidden_dim,
+                q_out_dim,
+                k_out_dim,
+                v_out_dim,
+                o_out_dim,
+                repeat_factor,
+                score_capacity,
+                pad_size,
+                cache_k_ptr,
+                cache_v_ptr,
+                d_pad_ptr,
+                d_norm_weight,
+                q_weight_entry.device_ptr,
+                k_weight_entry.device_ptr,
+                v_weight_entry.device_ptr,
+                o_weight_entry.device_ptr,
+                d_q_bias,
+                d_k_bias,
+                d_v_bias,
+                d_o_bias);
+            if (!can_reuse) {
+                decode_graph.reset();
+                cudaGraph_t graph = nullptr;
+                cudaGraphExec_t exec = nullptr;
+                cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
+                           "cudaStreamBeginCapture decode_seq1");
+                launch_decode_seq1_pipeline();
+                cuda_check(cudaStreamEndCapture(stream, &graph), "cudaStreamEndCapture decode_seq1");
+                cuda_check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
+                           "cudaGraphInstantiate decode_seq1");
+                decode_graph.graph = graph;
+                decode_graph.exec = exec;
+                fill_decode_graph_signature(
+                    decode_graph,
+                    batch,
+                    sample_id,
+                    params.num_heads,
+                    params.head_dim,
+                    hidden_dim,
+                    q_out_dim,
+                    k_out_dim,
+                    v_out_dim,
+                    o_out_dim,
+                    repeat_factor,
+                    score_capacity,
+                    pad_size,
+                    cache_k_ptr,
+                    cache_v_ptr,
+                    d_pad_ptr,
+                    d_norm_weight,
+                    q_weight_entry.device_ptr,
+                    k_weight_entry.device_ptr,
+                    v_weight_entry.device_ptr,
+                    o_weight_entry.device_ptr,
+                    d_q_bias,
+                    d_k_bias,
+                    d_v_bias,
+                    d_o_bias);
+                state.impl_->stats.decode_graph_captures += 1;
+            }
+            cuda_check(cudaGraphLaunch(decode_graph.exec, stream), "cudaGraphLaunch decode_seq1");
+            state.impl_->stats.decode_graph_launches += 1;
+            launched = true;
+        }
+        if (!launched) {
+            launch_decode_seq1_pipeline();
+        }
+
+        Tensor output(rows * o_out_dim);
+        cuda_check(cudaMemcpyAsync(output.data().data(), scratch.output.data(),
+                                   static_cast<size_t>(rows) * o_out_dim * Traits::kElementBytes,
+                                   cudaMemcpyDeviceToHost, stream),
+                   "cudaMemcpyAsync output decode_seq1");
+        cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize self_attn_forward_cuda decode_seq1");
+
+        output.reshape({batch, 1, o_out_dim});
+        return output;
     }
 
     maybe_add_bias<Traits>(stream, scratch.q_proj.data(), d_q_bias, rows, q_out_dim);

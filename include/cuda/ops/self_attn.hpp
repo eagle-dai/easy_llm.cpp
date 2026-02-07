@@ -14,6 +14,9 @@ namespace ops {
 struct SelfAttnCudaStats {
     std::uint64_t scratch_reallocations{0};
     std::uint64_t pad_lens_uploads{0};
+    std::uint64_t decode_seq1_path_hits{0};
+    std::uint64_t decode_graph_captures{0};
+    std::uint64_t decode_graph_launches{0};
 };
 
 struct SelfAttnCudaParams {

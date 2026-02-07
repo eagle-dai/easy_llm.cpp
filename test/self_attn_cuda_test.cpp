@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <random>
@@ -367,13 +368,28 @@ int main() {
     }
     const auto perf_stats = cuda_state_perf.stats();
     std::cout << "scratch_reallocations=" << perf_stats.scratch_reallocations
-              << ", pad_lens_uploads=" << perf_stats.pad_lens_uploads << "\n";
+              << ", pad_lens_uploads=" << perf_stats.pad_lens_uploads
+              << ", decode_seq1_path_hits=" << perf_stats.decode_seq1_path_hits
+              << ", decode_graph_captures=" << perf_stats.decode_graph_captures
+              << ", decode_graph_launches=" << perf_stats.decode_graph_launches << "\n";
     if (perf_stats.scratch_reallocations > 40) {
         std::cerr << "FAIL: scratch reallocations too high in decode loop\n";
         return 1;
     }
     if (perf_stats.pad_lens_uploads > 2) {
         std::cerr << "FAIL: pad_lens uploaded too many times\n";
+        return 1;
+    }
+    if (perf_stats.decode_seq1_path_hits < static_cast<std::uint64_t>(perf_steps)) {
+        std::cerr << "FAIL: decode seq=1 path was not consistently selected\n";
+        return 1;
+    }
+    if (perf_stats.decode_graph_captures == 0 || perf_stats.decode_graph_launches == 0) {
+        std::cerr << "FAIL: decode CUDA graph was not used\n";
+        return 1;
+    }
+    if (perf_stats.decode_graph_launches < perf_stats.decode_graph_captures) {
+        std::cerr << "FAIL: decode graph launches must be >= captures\n";
         return 1;
     }
 
