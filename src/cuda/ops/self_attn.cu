@@ -389,6 +389,38 @@ void upload_offsets_to_device(ForwardScratchBuffers& scratch,
                "cudaMemcpyAsync offsets");
 }
 
+void ensure_rope_inv_freq_device(SelfAttnCudaState::Impl& impl,
+                                 int head_dim,
+                                 float rope_theta,
+                                 cudaStream_t stream,
+                                 std::uint64_t* scratch_realloc_counter) {
+    if (head_dim <= 0 || (head_dim % 2) != 0) {
+        throw std::invalid_argument("ensure_rope_inv_freq_device: head_dim must be positive and even.");
+    }
+    if (rope_theta <= 0.0f) {
+        throw std::invalid_argument("ensure_rope_inv_freq_device: rope_theta must be positive.");
+    }
+    const int half_dim = head_dim / 2;
+    const size_t bytes = static_cast<size_t>(half_dim) * sizeof(float);
+    if (impl.rope_inv_freq_half_dim == half_dim &&
+        impl.rope_inv_freq_theta == rope_theta &&
+        impl.rope_inv_freq.bytes() >= bytes) {
+        return;
+    }
+
+    std::vector<float> inv_freq(static_cast<size_t>(half_dim));
+    for (int k = 0; k < half_dim; ++k) {
+        const float freq = std::pow(rope_theta, (2.0f * static_cast<float>(k)) / static_cast<float>(head_dim));
+        inv_freq[k] = 1.0f / freq;
+    }
+    ensure_device_buffer(impl.rope_inv_freq, bytes, scratch_realloc_counter);
+    cuda_check(cudaMemcpyAsync(impl.rope_inv_freq.data(), inv_freq.data(), bytes,
+                               cudaMemcpyHostToDevice, stream),
+               "cudaMemcpyAsync rope_inv_freq");
+    impl.rope_inv_freq_half_dim = half_dim;
+    impl.rope_inv_freq_theta = rope_theta;
+}
+
 AttentionMaskInputs build_attention_mask_inputs(SelfAttnCudaState::Impl& impl,
                                                 ForwardScratchBuffers& scratch,
                                                 const std::vector<int>& sample_ids,
@@ -409,7 +441,8 @@ AttentionMaskInputs build_attention_mask_inputs(SelfAttnCudaState::Impl& impl,
 }
 
 template <typename Traits>
-void prepare_decode_qkv(ForwardScratchBuffers& scratch,
+void prepare_decode_qkv(SelfAttnCudaState::Impl& impl,
+                        ForwardScratchBuffers& scratch,
                         const std::vector<int>& offsets,
                         const SelfAttnCudaParams& params,
                         const ForwardShapeInfo& shape,
@@ -444,6 +477,7 @@ void prepare_decode_qkv(ForwardScratchBuffers& scratch,
     cuda_check(cudaGetLastError(), "split_transpose_seq1_kernel");
 
     upload_offsets_to_device(scratch, offsets, shape.batch, stream, scratch_realloc_counter);
+    ensure_rope_inv_freq_device(impl, params.head_dim, params.rope_theta, stream, scratch_realloc_counter);
 
     const int rope_q_total = shape.batch * params.num_heads * (params.head_dim / 2);
     const int rope_k_total = shape.batch * params.num_heads_kv * (params.head_dim / 2);
@@ -452,16 +486,19 @@ void prepare_decode_qkv(ForwardScratchBuffers& scratch,
     rope_seq1_kernel<DeviceType><<<rope_q_blocks, kThreads, 0, stream>>>(
         static_cast<DeviceType*>(scratch.q.data()),
         static_cast<const int*>(scratch.offsets.data()),
-        shape.batch, params.num_heads, params.head_dim, params.rope_theta);
+        static_cast<const float*>(impl.rope_inv_freq.data()),
+        shape.batch, params.num_heads, params.head_dim);
     rope_seq1_kernel<DeviceType><<<rope_k_blocks, kThreads, 0, stream>>>(
         static_cast<DeviceType*>(scratch.k.data()),
         static_cast<const int*>(scratch.offsets.data()),
-        shape.batch, params.num_heads_kv, params.head_dim, params.rope_theta);
+        static_cast<const float*>(impl.rope_inv_freq.data()),
+        shape.batch, params.num_heads_kv, params.head_dim);
     cuda_check(cudaGetLastError(), "rope_seq1_kernel");
 }
 
 template <typename Traits>
-void prepare_prefill_qkv(ForwardScratchBuffers& scratch,
+void prepare_prefill_qkv(SelfAttnCudaState::Impl& impl,
+                         ForwardScratchBuffers& scratch,
                          const std::vector<int>& offsets,
                          const SelfAttnCudaParams& params,
                          const ForwardShapeInfo& shape,
@@ -496,6 +533,7 @@ void prepare_prefill_qkv(ForwardScratchBuffers& scratch,
     cuda_check(cudaGetLastError(), "split_transpose_kernel");
 
     upload_offsets_to_device(scratch, offsets, shape.batch, stream, scratch_realloc_counter);
+    ensure_rope_inv_freq_device(impl, params.head_dim, params.rope_theta, stream, scratch_realloc_counter);
 
     const int rope_q_total = shape.batch * params.num_heads * shape.seq_len * (params.head_dim / 2);
     const int rope_k_total = shape.batch * params.num_heads_kv * shape.seq_len * (params.head_dim / 2);
@@ -504,11 +542,13 @@ void prepare_prefill_qkv(ForwardScratchBuffers& scratch,
     rope_kernel<DeviceType><<<rope_q_blocks, kThreads, 0, stream>>>(
         static_cast<DeviceType*>(scratch.q.data()),
         static_cast<const int*>(scratch.offsets.data()),
-        shape.batch, params.num_heads, shape.seq_len, params.head_dim, params.rope_theta);
+        static_cast<const float*>(impl.rope_inv_freq.data()),
+        shape.batch, params.num_heads, shape.seq_len, params.head_dim);
     rope_kernel<DeviceType><<<rope_k_blocks, kThreads, 0, stream>>>(
         static_cast<DeviceType*>(scratch.k.data()),
         static_cast<const int*>(scratch.offsets.data()),
-        shape.batch, params.num_heads_kv, shape.seq_len, params.head_dim, params.rope_theta);
+        static_cast<const float*>(impl.rope_inv_freq.data()),
+        shape.batch, params.num_heads_kv, shape.seq_len, params.head_dim);
     cuda_check(cudaGetLastError(), "rope_kernel");
 }
 
@@ -648,7 +688,8 @@ Tensor run_decode_seq1_path(SelfAttnCudaState::Impl& impl,
                             cublasHandle_t handle,
                             std::uint64_t* scratch_realloc_counter) {
     const bool use_fused_decode_attention = true;
-    prepare_decode_qkv<Traits>(scratch,
+    prepare_decode_qkv<Traits>(impl,
+                               scratch,
                                offsets,
                                params,
                                shape,
@@ -797,7 +838,8 @@ Tensor run_prefill_path(SelfAttnCudaState::Impl& impl,
     constexpr int kThreads = 256;
     const bool use_fused_prefill_attention = true;
 
-    prepare_prefill_qkv<Traits>(scratch,
+    prepare_prefill_qkv<Traits>(impl,
+                                scratch,
                                 offsets,
                                 params,
                                 shape,

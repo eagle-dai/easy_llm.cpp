@@ -1,5 +1,10 @@
 #include "ops.hpp"
 
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <iostream>
 
@@ -135,6 +140,62 @@ Tensor matmul_3d_impl(const Tensor& input, const Tensor& weights, const Tensor* 
 #endif
 
     return matmul_3d_cpu(input, weights, shape.batch, shape.seq_len, shape.height, shape.width, bias);
+}
+
+using RopeCacheKey = std::pair<int, std::uint32_t>;
+
+std::uint32_t float_to_bits(float value) {
+    std::uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value), "float_to_bits: unexpected float size.");
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+const std::vector<float>& get_rope_inv_freq(int head_dim, float rope_theta) {
+    if (head_dim <= 0 || (head_dim % 2) != 0) {
+        throw std::invalid_argument("head_dim must be positive and even for RoPE.");
+    }
+    if (rope_theta <= 0.0f) {
+        throw std::invalid_argument("rope_theta must be positive for RoPE.");
+    }
+
+    static std::map<RopeCacheKey, std::vector<float>> cache;
+    static std::mutex cache_mutex;
+
+    const RopeCacheKey key{head_dim, float_to_bits(rope_theta)};
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    const int half_dim = head_dim / 2;
+    std::vector<float> inv_freq(static_cast<size_t>(half_dim));
+    for (int k = 0; k < half_dim; ++k) {
+        const float freq = std::pow(rope_theta, (2.0f * static_cast<float>(k)) / static_cast<float>(head_dim));
+        inv_freq[k] = 1.0f / freq;
+    }
+    return cache.emplace(key, std::move(inv_freq)).first->second;
+}
+
+void validate_rope_shape(const Tensor& input,
+                         int& batch_size,
+                         int& num_heads,
+                         int& seq_len,
+                         int& head_dim,
+                         int& half_dim) {
+    if (input.shape().size() != 4) {
+        throw std::invalid_argument("apply_rope expects a 4D tensor [batch, head, seq, dim]. Got shape: " +
+                                    fmt::format("{}", fmt::join(input.shape(), ", ")));
+    }
+    batch_size = input.shape()[0];
+    num_heads = input.shape()[1];
+    seq_len = input.shape()[2];
+    head_dim = input.shape()[3];
+    if ((head_dim % 2) != 0) {
+        throw std::invalid_argument("head_dim must be even for RoPE.");
+    }
+    half_dim = head_dim / 2;
 }
 
 } // namespace
@@ -329,38 +390,62 @@ Tensor concat(const vector<Tensor>& inputs, int axis) {
 }
 
 void apply_rope(Tensor& input, int offset, float rope_theta) {
-    // RoPE: Relative Positional Encoding for 4D Tensor [batch, head, seq, dim]
-    if (input.shape().size() != 4) {
-        throw std::invalid_argument("apply_rope expects a 4D tensor [batch, head, seq, dim]. Got shape: " + fmt::format("{}", fmt::join(input.shape(), ", ")));
-    }
-    int batch_size = input.shape()[0];
-    int num_heads = input.shape()[1];
-    int seq_len = input.shape()[2];
-    int head_dim = input.shape()[3];
-    int half_dim = head_dim / 2;
-    if (head_dim % 2 != 0) throw std::invalid_argument("head_dim must be even for RoPE.");
-    vector<float> freq_factors(half_dim);  // Precompute frequency factors so we do not repeat the calculation each outer loop
-    for (int k = 0; k < half_dim; ++k) {
-        freq_factors[k] = std::pow(rope_theta, (2.0f * k) / static_cast<float>(head_dim));
-    }
-
-    auto &data = input.data();
+    int batch_size = 0;
+    int num_heads = 0;
+    int seq_len = 0;
+    int head_dim = 0;
+    int half_dim = 0;
+    validate_rope_shape(input, batch_size, num_heads, seq_len, head_dim, half_dim);
+    const auto& inv_freq = get_rope_inv_freq(head_dim, rope_theta);
+    auto& data = input.data();
 #ifdef USE_OPENMP
-    #pragma omp parallel for collapse(4)
+    #pragma omp parallel for collapse(3)
 #endif
     for (int i = 0; i < batch_size; ++i) {
         for (int h = 0; h < num_heads; ++h) {
             for (int j = 0; j < seq_len; ++j) {
                 for (int k = 0; k < half_dim; ++k) {
-                    float freq = freq_factors[k];
-                    float theta = static_cast<float>(j + offset) / freq;
+                    const float theta = static_cast<float>(j + offset) * inv_freq[k];
                     float cos_t = std::cos(theta);
                     float sin_t = std::sin(theta);
-                    
-                    int idx1 = i * (num_heads * seq_len * head_dim) +
-                               h * (seq_len * head_dim) +
-                               j * head_dim +
-                               k;
+
+                    int idx1 = i * (num_heads * seq_len * head_dim) + h * (seq_len * head_dim) + j * head_dim + k;
+                    int idx2 = idx1 + half_dim;
+                    data_type x1 = data[idx1];
+                    data_type x2 = data[idx2];
+                    data[idx1] = x1 * data_type(cos_t) - x2 * data_type(sin_t);
+                    data[idx2] = x1 * data_type(sin_t) + x2 * data_type(cos_t);
+                }
+            }
+        }
+    }
+}
+
+void apply_rope(Tensor& input, const std::vector<int>& offsets, float rope_theta) {
+    int batch_size = 0;
+    int num_heads = 0;
+    int seq_len = 0;
+    int head_dim = 0;
+    int half_dim = 0;
+    validate_rope_shape(input, batch_size, num_heads, seq_len, head_dim, half_dim);
+    if (static_cast<int>(offsets.size()) != batch_size) {
+        throw std::invalid_argument("apply_rope offsets size must match tensor batch size.");
+    }
+
+    const auto& inv_freq = get_rope_inv_freq(head_dim, rope_theta);
+    auto& data = input.data();
+#ifdef USE_OPENMP
+    #pragma omp parallel for collapse(3)
+#endif
+    for (int i = 0; i < batch_size; ++i) {
+        for (int h = 0; h < num_heads; ++h) {
+            for (int j = 0; j < seq_len; ++j) {
+                for (int k = 0; k < half_dim; ++k) {
+                    const float theta = static_cast<float>(j + offsets[i]) * inv_freq[k];
+                    float cos_t = std::cos(theta);
+                    float sin_t = std::sin(theta);
+
+                    int idx1 = i * (num_heads * seq_len * head_dim) + h * (seq_len * head_dim) + j * head_dim + k;
                     int idx2 = idx1 + half_dim;
                     data_type x1 = data[idx1];
                     data_type x2 = data[idx2];

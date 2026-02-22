@@ -90,6 +90,10 @@ add_executable(easy_llm_matmul_test test/matmul_3d_test.cpp)
 target_link_libraries(easy_llm_matmul_test PRIVATE easy_llm_core)
 add_test(NAME easy_llm_matmul_test COMMAND easy_llm_matmul_test)
 
+add_executable(easy_llm_rope_test test/rope_test.cpp)
+target_link_libraries(easy_llm_rope_test PRIVATE easy_llm_core)
+add_test(NAME easy_llm_rope_test COMMAND easy_llm_rope_test)
+
 if(EASY_LLM_ENABLE_CUDA)
     add_executable(easy_llm_self_attn_cuda_test test/self_attn_cuda_test.cpp)
     target_link_libraries(easy_llm_self_attn_cuda_test PRIVATE easy_llm_core)

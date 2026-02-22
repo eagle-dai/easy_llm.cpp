@@ -136,6 +136,9 @@ struct SelfAttnCudaState::Impl {
     std::vector<SampleCache> samples;
     int num_heads{0};
     int head_dim{0};
+    DeviceBuffer rope_inv_freq;
+    int rope_inv_freq_half_dim{0};
+    float rope_inv_freq_theta{0.0f};
     ForwardScratchBuffers scratch;
     TensorUploadCache norm_weight_cache;
     TensorUploadCache q_bias_cache;
@@ -508,11 +511,11 @@ __global__ void pack_cache_interleaved_to_heads_kernel(const T* src_interleaved,
 template <typename T>
 __global__ void rope_kernel(T* input,
                             const int* offsets,
+                            const float* inv_freq,
                             int batch,
                             int num_heads,
                             int seq_len,
-                            int head_dim,
-                            float rope_theta) {
+                            int head_dim) {
     int half_dim = head_dim / 2;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = batch * num_heads * seq_len * half_dim;
@@ -529,8 +532,7 @@ __global__ void rope_kernel(T* input,
     int idx2 = idx1 + half_dim;
     float x1 = to_float(input[idx1]);
     float x2 = to_float(input[idx2]);
-    float freq = powf(rope_theta, (2.0f * static_cast<float>(k)) / static_cast<float>(head_dim));
-    float angle = static_cast<float>(s + offsets[b]) / freq;
+    float angle = static_cast<float>(s + offsets[b]) * inv_freq[k];
     float cos_v = cosf(angle);
     float sin_v = sinf(angle);
     input[idx1] = from_float<T>(x1 * cos_v - x2 * sin_v);
@@ -540,10 +542,10 @@ __global__ void rope_kernel(T* input,
 template <typename T>
 __global__ void rope_seq1_kernel(T* input,
                                  const int* offsets,
+                                 const float* inv_freq,
                                  int batch,
                                  int num_heads,
-                                 int head_dim,
-                                 float rope_theta) {
+                                 int head_dim) {
     int half_dim = head_dim / 2;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = batch * num_heads * half_dim;
@@ -559,8 +561,7 @@ __global__ void rope_seq1_kernel(T* input,
     int idx2 = idx1 + half_dim;
     float x1 = to_float(input[idx1]);
     float x2 = to_float(input[idx2]);
-    float freq = powf(rope_theta, (2.0f * static_cast<float>(k)) / static_cast<float>(head_dim));
-    float angle = static_cast<float>(offsets[b]) / freq;
+    float angle = static_cast<float>(offsets[b]) * inv_freq[k];
     float cos_v = cosf(angle);
     float sin_v = sinf(angle);
     input[idx1] = from_float<T>(x1 * cos_v - x2 * sin_v);

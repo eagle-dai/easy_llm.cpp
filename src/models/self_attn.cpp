@@ -59,30 +59,6 @@ Tensor slice_batch_4d(const Tensor& input, int batch_index) {
     return Tensor{data, {1, num_heads, seq_len, head_dim}};
 }
 
-void write_batch_4d(Tensor& target, int batch_index, const Tensor& slice) {
-    const auto& target_shape = target.shape();
-    const auto& slice_shape = slice.shape();
-    if (target_shape.size() != 4 || slice_shape.size() != 4) {
-        throw std::invalid_argument("write_batch_4d expects 4D tensors.");
-    }
-    if (slice_shape[0] != 1 || slice_shape[1] != target_shape[1] ||
-        slice_shape[2] != target_shape[2] || slice_shape[3] != target_shape[3]) {
-        throw std::invalid_argument("write_batch_4d slice shape mismatch.");
-    }
-    int batch = target_shape[0];
-    if (batch_index < 0 || batch_index >= batch) {
-        throw std::out_of_range("write_batch_4d batch index out of range.");
-    }
-    int block = target_shape[1] * target_shape[2] * target_shape[3];
-    if (target.size() != batch * block) {
-        throw std::invalid_argument("write_batch_4d: target size does not match shape.");
-    }
-    int start = batch_index * block;
-    const auto& src = slice.data();
-    auto& dst = target.data();
-    std::copy(src.begin(), src.end(), dst.begin() + start);
-}
-
 bool is_uniform_offset(const std::vector<int>& offsets) {
     if (offsets.empty()) {
         return true;
@@ -338,15 +314,8 @@ void SelfAttn::apply_rope_offsets(Tensor& q, Tensor& k, const ForwardContext& ct
         ops::apply_rope(k, offset0, rope_theta_);
         return;
     }
-    for (int i = 0; i < static_cast<int>(ctx.sample_ids.size()); ++i) {
-        int sample_offset = ctx.offsets[i];
-        Tensor q_slice = slice_batch_4d(q, i);
-        Tensor k_slice = slice_batch_4d(k, i);
-        ops::apply_rope(q_slice, sample_offset, rope_theta_);
-        ops::apply_rope(k_slice, sample_offset, rope_theta_);
-        write_batch_4d(q, i, q_slice);
-        write_batch_4d(k, i, k_slice);
-    }
+    ops::apply_rope(q, ctx.offsets, rope_theta_);
+    ops::apply_rope(k, ctx.offsets, rope_theta_);
 }
 
 void SelfAttn::expand_kv_heads(Tensor& k, Tensor& v) {
