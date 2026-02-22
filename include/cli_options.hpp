@@ -14,7 +14,12 @@ struct CliOptions {
     float top_p{0.95f};
     int top_k{20};
     int seed{42};
+    int serve_max_active{16};
+    int serve_prefill_batch{4};
+    int serve_idle_ms{2};
+    int serve_stats_ms{1000};
     bool use_greedy{false};
+    bool serve{false};
     bool show_help{false};
 };
 

@@ -193,10 +193,10 @@ __device__ __forceinline__ int clamp_int(int value, int min_value, int max_value
     return value;
 }
 
-__device__ __forceinline__ int resolve_active_len(const int* active_len_ptr, int max_len) {
+__device__ __forceinline__ int resolve_active_len(const int* active_len_ptr, int max_len, int batch_index) {
     int active_len = max_len;
     if (active_len_ptr != nullptr) {
-        active_len = active_len_ptr[0];
+        active_len = active_len_ptr[batch_index];
     }
     return clamp_int(active_len, 0, max_len);
 }
@@ -489,19 +489,20 @@ __global__ void append_kv_interleaved_kernel(const T* src_heads_major,
 template <typename T>
 __global__ void pack_cache_interleaved_to_heads_kernel(const T* src_interleaved,
                                                        T* dst_heads_major,
-                                                       int total_len,
+                                                       int src_len,
+                                                       int dst_len,
                                                        int num_heads_kv,
                                                        int head_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = total_len * num_heads_kv * head_dim;
+    int total = src_len * num_heads_kv * head_dim;
     if (idx >= total) {
         return;
     }
     int d = idx % head_dim;
-    int t = (idx / head_dim) % total_len;
-    int h = idx / (head_dim * total_len);
+    int t = (idx / head_dim) % src_len;
+    int h = idx / (head_dim * src_len);
     int src_idx = ((t * num_heads_kv + h) * head_dim) + d;
-    int dst_idx = ((h * total_len + t) * head_dim) + d;
+    int dst_idx = ((h * dst_len + t) * head_dim) + d;
     dst_heads_major[dst_idx] = src_interleaved[src_idx];
 }
 
@@ -621,7 +622,7 @@ __global__ void mask_scale_softmax_decode_kernel(T* scores,
 
     int b = row / heads;
     int row_base = row * score_len;
-    int active_len = resolve_active_len(active_len_ptr, score_len);
+    int active_len = resolve_active_len(active_len_ptr, score_len, b);
     int pad_len = resolve_pad_len(sample_ids, pad_lens, pad_lens_size, b, active_len);
 
     softmax_row_inplace(scores + row_base,
@@ -666,7 +667,7 @@ __global__ void fused_decode_attention_kernel(const T* q,
     int h = row % num_heads;
     int kv_h = h / repeat_factor;
     int q_base = (b * num_heads + h) * head_dim;
-    int active_len = resolve_active_len(active_len_ptr, cache_capacity_len);
+    int active_len = resolve_active_len(active_len_ptr, cache_capacity_len, b);
     int pad_len = resolve_pad_len(sample_ids, pad_lens, pad_lens_size, b, active_len);
     int out_base = (b * num_heads + h) * head_dim;
 
@@ -1019,16 +1020,21 @@ void append_sample_cache(SampleCache& sample,
     sample.len = new_len;
 }
 
+struct ActiveCacheInfo {
+    int max_len{0};
+    std::vector<int> active_lens;
+};
+
 template <typename Traits>
-int append_kv_cache(SelfAttnCudaState::Impl& impl,
-                    const std::vector<int>& sample_ids,
-                    int batch,
-                    int seq_len,
-                    int num_heads_kv,
-                    int head_dim,
-                    const DeviceBuffer& d_k,
-                    const DeviceBuffer& d_v,
-                    cudaStream_t stream) {
+ActiveCacheInfo append_kv_cache(SelfAttnCudaState::Impl& impl,
+                                const std::vector<int>& sample_ids,
+                                int batch,
+                                int seq_len,
+                                int num_heads_kv,
+                                int head_dim,
+                                const DeviceBuffer& d_k,
+                                const DeviceBuffer& d_v,
+                                cudaStream_t stream) {
     const size_t elem_bytes = Traits::kElementBytes;
     const size_t sample_bytes = static_cast<size_t>(num_heads_kv) * seq_len * head_dim * elem_bytes;
     for (int i = 0; i < batch; ++i) {
@@ -1042,19 +1048,18 @@ int append_kv_cache(SelfAttnCudaState::Impl& impl,
         const char* v_slice = static_cast<const char*>(d_v.data()) + static_cast<size_t>(i) * sample_bytes;
         append_sample_cache<Traits>(sample, k_slice, v_slice, num_heads_kv, seq_len, head_dim, stream);
     }
-    int total_len = 0;
-    if (!sample_ids.empty()) {
-        total_len = impl.samples[sample_ids[0]].len;
-        for (int sample_id : sample_ids) {
-            if (sample_id < 0 || sample_id >= static_cast<int>(impl.samples.size())) {
-                throw std::out_of_range("sample_id out of cache range.");
-            }
-            if (impl.samples[sample_id].len != total_len) {
-                throw std::invalid_argument("Active sample cache lengths must match.");
-            }
+
+    ActiveCacheInfo active_cache{};
+    active_cache.active_lens.reserve(sample_ids.size());
+    for (int sample_id : sample_ids) {
+        if (sample_id < 0 || sample_id >= static_cast<int>(impl.samples.size())) {
+            throw std::out_of_range("sample_id out of cache range.");
         }
+        const int len = impl.samples[sample_id].len;
+        active_cache.active_lens.push_back(len);
+        active_cache.max_len = std::max(active_cache.max_len, len);
     }
-    return total_len;
+    return active_cache;
 }
 
 template <typename Traits>
@@ -1073,24 +1078,29 @@ void build_cache_batch(const SelfAttnCudaState::Impl& impl,
     const size_t sample_bytes = static_cast<size_t>(num_heads_kv) * total_len * head_dim * elem_bytes;
     ensure_device_buffer(d_cache_k_batch, sample_bytes * batch);
     ensure_device_buffer(d_cache_v_batch, sample_bytes * batch);
-    const int pack_total = total_len * num_heads_kv * head_dim;
-    const int pack_blocks = (pack_total + kThreads - 1) / kThreads;
     for (int i = 0; i < batch; ++i) {
         int sample_id = sample_ids[i];
         const SampleCache& sample = impl.samples[sample_id];
-        if (sample.len != total_len) {
-            throw std::invalid_argument("Cache length mismatch while building batch cache.");
+        if (sample.len > total_len) {
+            throw std::invalid_argument("Cache length exceeds batched cache capacity.");
         }
         char* dst_k = static_cast<char*>(d_cache_k_batch.data()) + static_cast<size_t>(i) * sample_bytes;
         char* dst_v = static_cast<char*>(d_cache_v_batch.data()) + static_cast<size_t>(i) * sample_bytes;
+        cuda_check(cudaMemsetAsync(dst_k, 0, sample_bytes, stream), "cudaMemsetAsync cache k batch");
+        cuda_check(cudaMemsetAsync(dst_v, 0, sample_bytes, stream), "cudaMemsetAsync cache v batch");
+        if (sample.len <= 0) {
+            continue;
+        }
+        const int pack_total = sample.len * num_heads_kv * head_dim;
+        const int pack_blocks = (pack_total + kThreads - 1) / kThreads;
         pack_cache_interleaved_to_heads_kernel<DeviceType><<<pack_blocks, kThreads, 0, stream>>>(
             static_cast<const DeviceType*>(sample.k.data()),
             reinterpret_cast<DeviceType*>(dst_k),
-            total_len, num_heads_kv, head_dim);
+            sample.len, total_len, num_heads_kv, head_dim);
         pack_cache_interleaved_to_heads_kernel<DeviceType><<<pack_blocks, kThreads, 0, stream>>>(
             static_cast<const DeviceType*>(sample.v.data()),
             reinterpret_cast<DeviceType*>(dst_v),
-            total_len, num_heads_kv, head_dim);
+            sample.len, total_len, num_heads_kv, head_dim);
     }
     cuda_check(cudaGetLastError(), "pack_cache_interleaved_to_heads_kernel");
 }
@@ -1112,14 +1122,20 @@ void build_cache_batch_interleaved(const SelfAttnCudaState::Impl& impl,
     for (int i = 0; i < batch; ++i) {
         int sample_id = sample_ids[i];
         const SampleCache& sample = impl.samples[sample_id];
-        if (sample.len != total_len) {
-            throw std::invalid_argument("Cache length mismatch while building interleaved batch cache.");
+        if (sample.len > total_len) {
+            throw std::invalid_argument("Cache length exceeds interleaved batch capacity.");
         }
         char* dst_k = static_cast<char*>(d_cache_k_batch.data()) + static_cast<size_t>(i) * sample_bytes;
         char* dst_v = static_cast<char*>(d_cache_v_batch.data()) + static_cast<size_t>(i) * sample_bytes;
-        cuda_check(cudaMemcpyAsync(dst_k, sample.k.data(), sample_bytes, cudaMemcpyDeviceToDevice, stream),
+        cuda_check(cudaMemsetAsync(dst_k, 0, sample_bytes, stream), "cudaMemsetAsync cache k batch interleaved");
+        cuda_check(cudaMemsetAsync(dst_v, 0, sample_bytes, stream), "cudaMemsetAsync cache v batch interleaved");
+        if (sample.len <= 0) {
+            continue;
+        }
+        const size_t copy_bytes = static_cast<size_t>(num_heads_kv) * sample.len * head_dim * elem_bytes;
+        cuda_check(cudaMemcpyAsync(dst_k, sample.k.data(), copy_bytes, cudaMemcpyDeviceToDevice, stream),
                    "cudaMemcpyAsync cache k batch interleaved");
-        cuda_check(cudaMemcpyAsync(dst_v, sample.v.data(), sample_bytes, cudaMemcpyDeviceToDevice, stream),
+        cuda_check(cudaMemcpyAsync(dst_v, sample.v.data(), copy_bytes, cudaMemcpyDeviceToDevice, stream),
                    "cudaMemcpyAsync cache v batch interleaved");
     }
 }

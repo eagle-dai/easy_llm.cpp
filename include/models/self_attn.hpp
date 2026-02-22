@@ -10,6 +10,7 @@
 #include "models/loader.hpp"
 #include "models/linear.hpp"
 #include "models/norm.hpp"
+#include "models/cache_batching.hpp"
 #ifdef USE_CUDA
     #include "cuda/ops/self_attn.hpp"
 #endif
@@ -30,6 +31,7 @@ public:
     void clear_kv_cache(int sample_id);
     void reset_kv_cache();
     void set_pad_lens(const std::vector<int>& pad_lens);
+    void set_cuda_enabled(bool enabled);
 
 private:
     struct ForwardContext;
@@ -39,9 +41,12 @@ private:
     void compute_offsets(ForwardContext& ctx) const;
     void apply_rope_offsets(Tensor& q, Tensor& k, const ForwardContext& ctx);
     void expand_kv_heads(Tensor& k, Tensor& v);
-    void apply_attention_masks(Tensor& scores, const ForwardContext& ctx) const;
+    void apply_attention_masks(Tensor& scores,
+                               const ForwardContext& ctx,
+                               const std::vector<int>& valid_lens) const;
     void append_kv_cache(const Tensor& k, const Tensor& v, const ForwardContext& ctx);
-    Tensor build_active_cache(const std::vector<Tensor>& cache_by_sample, const ForwardContext& ctx) const;
+    BatchedCacheView build_active_cache(const std::vector<Tensor>& cache_by_sample,
+                                        const ForwardContext& ctx) const;
     void ensure_cache_capacity(int min_size);
 
     int hidden_dim_;

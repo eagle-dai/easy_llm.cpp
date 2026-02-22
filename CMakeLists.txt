@@ -90,10 +90,22 @@ add_executable(easy_llm_matmul_test test/matmul_3d_test.cpp)
 target_link_libraries(easy_llm_matmul_test PRIVATE easy_llm_core)
 add_test(NAME easy_llm_matmul_test COMMAND easy_llm_matmul_test)
 
+add_executable(easy_llm_cache_batching_test test/cache_batching_test.cpp)
+target_link_libraries(easy_llm_cache_batching_test PRIVATE easy_llm_core)
+add_test(NAME easy_llm_cache_batching_test COMMAND easy_llm_cache_batching_test)
+
+add_executable(easy_llm_cli_options_test test/cli_options_test.cpp)
+target_link_libraries(easy_llm_cli_options_test PRIVATE easy_llm_core)
+add_test(NAME easy_llm_cli_options_test COMMAND easy_llm_cli_options_test)
+
 if(EASY_LLM_ENABLE_CUDA)
     add_executable(easy_llm_self_attn_cuda_test test/self_attn_cuda_test.cpp)
     target_link_libraries(easy_llm_self_attn_cuda_test PRIVATE easy_llm_core)
     add_test(NAME easy_llm_self_attn_cuda_test COMMAND easy_llm_self_attn_cuda_test)
+
+    add_executable(easy_llm_self_attn_cuda_varlen_test test/self_attn_cuda_varlen_test.cpp)
+    target_link_libraries(easy_llm_self_attn_cuda_varlen_test PRIVATE easy_llm_core)
+    add_test(NAME easy_llm_self_attn_cuda_varlen_test COMMAND easy_llm_self_attn_cuda_varlen_test)
 
     add_executable(easy_llm_mlp_cuda_test test/mlp_cuda_test.cpp)
     target_link_libraries(easy_llm_mlp_cuda_test PRIVATE easy_llm_core)
