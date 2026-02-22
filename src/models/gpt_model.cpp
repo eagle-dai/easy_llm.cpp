@@ -13,6 +13,7 @@
 #include "ops.hpp"
 #include "sampler.hpp"
 #include "models/layer_key_prefix.hpp"
+#include "models/generation_invariants.hpp"
 
 namespace easy_llm {
 
@@ -32,35 +33,11 @@ struct GptModel::GenerationContext {
     std::vector<int> pos_lens_by_sample;
 
     std::vector<int> build_prefill_pos_offsets() const {
-        std::vector<int> pos_offsets;
-        pos_offsets.reserve(sample_ids.size());
-        for (int sample_id : sample_ids) {
-            if (sample_id < 0 || sample_id >= static_cast<int>(pad_lens.size())) {
-                throw std::invalid_argument(
-                    "prefill: sample_id out of range for pad_lens (sample_id=" +
-                    std::to_string(sample_id) + ", pad_lens size=" +
-                    std::to_string(pad_lens.size()) + ").");
-            } else {
-                pos_offsets.push_back(-pad_lens[sample_id]);
-            }
-        }
-        return pos_offsets;
+        return generation::build_prefill_pos_offsets(sample_ids, pad_lens);
     }
 
     std::vector<int> build_decode_pos_offsets() const {
-        std::vector<int> pos_offsets;
-        pos_offsets.reserve(sample_ids.size());
-        for (int sample_id : sample_ids) {
-            if (sample_id < 0 || sample_id >= static_cast<int>(pos_lens_by_sample.size())) {
-                throw std::invalid_argument(
-                    "decode: sample_id out of range for pos_lens_by_sample (sample_id=" +
-                    std::to_string(sample_id) + ", pos_lens_by_sample size=" +
-                    std::to_string(pos_lens_by_sample.size()) + ").");
-            } else {
-                pos_offsets.push_back(pos_lens_by_sample[sample_id]);
-            }
-        }
-        return pos_offsets;
+        return generation::build_decode_pos_offsets(sample_ids, pos_lens_by_sample);
     }
 };
 
@@ -309,11 +286,7 @@ void GptModel::decode(GenerationContext& ctx) {
 }
 
 void GptModel::apply_eos_filter_and_update_state(GenerationContext& ctx) {
-    for (int sample_id : ctx.sample_ids) {
-        if (sample_id >= 0 && sample_id < static_cast<int>(ctx.pos_lens_by_sample.size())) {
-            ctx.pos_lens_by_sample[sample_id] += 1;
-        }
-    }
+    generation::increment_pos_lens(ctx.sample_ids, ctx.pos_lens_by_sample);
     ctx.step += 1;
     filter_eos_samples(ctx);
 }
@@ -322,22 +295,13 @@ void GptModel::filter_eos_samples(GenerationContext& ctx) {
     if (!ctx.eos_enabled) {
         return;
     }
-    std::vector<int> new_sample_ids;
-    std::vector<int> new_next_tokens;
-    new_sample_ids.reserve(ctx.sample_ids.size());
-    new_next_tokens.reserve(ctx.next_generated_tokens.size());
-    for (int i = 0; i < static_cast<int>(ctx.sample_ids.size()); ++i) {
-        int token = ctx.next_generated_tokens[i];
-        int sample_id = ctx.sample_ids[i];
-        if (token == config_.eos_token_id) {
-            clear_kv_cache(sample_id);
-            continue;
-        }
-        new_sample_ids.push_back(sample_id);
-        new_next_tokens.push_back(token);
+    generation::EosFilterResult filtered =
+        generation::filter_eos_samples(ctx.sample_ids, ctx.next_generated_tokens, config_.eos_token_id);
+    for (int sample_id : filtered.cleared_sample_ids) {
+        clear_kv_cache(sample_id);
     }
-    ctx.sample_ids.swap(new_sample_ids);
-    ctx.next_generated_tokens.swap(new_next_tokens);
+    ctx.sample_ids.swap(filtered.sample_ids);
+    ctx.next_generated_tokens.swap(filtered.next_tokens);
 }
 
 Tensor GptModel::forward_logits(GenerationContext& ctx,

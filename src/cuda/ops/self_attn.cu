@@ -736,6 +736,12 @@ Tensor run_decode_seq1_path(SelfAttnCudaState::Impl& impl,
             resources.d_v_bias,
             resources.d_o_bias);
         if (!can_reuse) {
+            // Warm up once before graph capture so any lazy allocations happen
+            // outside capture (e.g. allocator/cublas internal buffers).
+            launch_decode_pipeline();
+            cuda_check(cudaStreamSynchronize(stream),
+                       "cudaStreamSynchronize decode_seq1 warmup");
+
             decode_graph.reset();
             cudaGraph_t graph = nullptr;
             cudaGraphExec_t exec = nullptr;
