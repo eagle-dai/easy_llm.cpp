@@ -560,7 +560,8 @@ DecodeAttentionResources prepare_decode_attention_resources(SelfAttnCudaState::I
                                                             const SelfAttnCudaParams& params,
                                                             const ForwardShapeInfo& shape,
                                                             bool use_fused_decode_attention,
-                                                            int total_len,
+                                                            const std::vector<int>& active_lens,
+                                                            int max_len,
                                                             cudaStream_t stream,
                                                             std::uint64_t* scratch_realloc_counter) {
     DecodeAttentionResources decode_resources{};
@@ -570,7 +571,7 @@ DecodeAttentionResources prepare_decode_attention_resources(SelfAttnCudaState::I
         sample_ids,
         shape.batch,
         params.num_heads_kv,
-        total_len,
+        max_len,
         params.head_dim,
         use_fused_decode_attention,
         true,
@@ -590,9 +591,19 @@ DecodeAttentionResources prepare_decode_attention_resources(SelfAttnCudaState::I
         ensure_device_buffer(scratch.scores, static_cast<size_t>(shape.batch) * params.num_heads * decode_resources.score_capacity * Traits::kElementBytes, scratch_realloc_counter);
     }
 
+    if (active_lens.size() != static_cast<size_t>(shape.batch)) {
+        throw std::invalid_argument("prepare_decode_attention_resources: active_lens size mismatch.");
+    }
+    for (int len : active_lens) {
+        if (len < 0 || len > decode_resources.score_capacity) {
+            throw std::invalid_argument("prepare_decode_attention_resources: active_lens value out of range.");
+        }
+    }
+
     ensure_device_buffer(scratch.context, static_cast<size_t>(shape.batch) * params.num_heads * params.head_dim * Traits::kElementBytes, scratch_realloc_counter);
-    ensure_device_buffer(scratch.decode_active_len, sizeof(int), scratch_realloc_counter);
-    cuda_check(cudaMemcpyAsync(scratch.decode_active_len.data(), &total_len, sizeof(int),
+    const size_t active_len_bytes = static_cast<size_t>(shape.batch) * sizeof(int);
+    ensure_device_buffer(scratch.decode_active_len, active_len_bytes, scratch_realloc_counter);
+    cuda_check(cudaMemcpyAsync(scratch.decode_active_len.data(), active_lens.data(), active_len_bytes,
                                cudaMemcpyHostToDevice, stream),
                "cudaMemcpyAsync decode_active_len");
     decode_resources.d_active_len = static_cast<const int*>(scratch.decode_active_len.data());
@@ -697,16 +708,16 @@ Tensor run_decode_seq1_path(SelfAttnCudaState::Impl& impl,
                                stream,
                                scratch_realloc_counter);
 
-    const int total_len = append_kv_cache<Traits>(impl,
-                                                  sample_ids,
-                                                  shape.batch,
-                                                  shape.seq_len,
-                                                  params.num_heads_kv,
-                                                  params.head_dim,
-                                                  scratch.k,
-                                                  scratch.v,
-                                                  stream);
-    if (total_len <= 0) {
+    const ActiveCacheInfo active_cache = append_kv_cache<Traits>(impl,
+                                                                  sample_ids,
+                                                                  shape.batch,
+                                                                  shape.seq_len,
+                                                                  params.num_heads_kv,
+                                                                  params.head_dim,
+                                                                  scratch.k,
+                                                                  scratch.v,
+                                                                  stream);
+    if (active_cache.max_len <= 0) {
         throw std::runtime_error("self_attn_forward_cuda: cache length is zero after append.");
     }
 
@@ -718,7 +729,8 @@ Tensor run_decode_seq1_path(SelfAttnCudaState::Impl& impl,
         params,
         shape,
         use_fused_decode_attention,
-        total_len,
+        active_cache.active_lens,
+        active_cache.max_len,
         stream,
         scratch_realloc_counter);
 
@@ -765,6 +777,12 @@ Tensor run_decode_seq1_path(SelfAttnCudaState::Impl& impl,
             resources.d_v_bias,
             resources.d_o_bias);
         if (!can_reuse) {
+            // Warm up once before graph capture so any lazy allocations happen
+            // outside capture (e.g. allocator/cublas internal buffers).
+            launch_decode_pipeline();
+            cuda_check(cudaStreamSynchronize(stream),
+                       "cudaStreamSynchronize decode_seq1 warmup");
+
             decode_graph.reset();
             cudaGraph_t graph = nullptr;
             cudaGraphExec_t exec = nullptr;
@@ -847,17 +865,23 @@ Tensor run_prefill_path(SelfAttnCudaState::Impl& impl,
                                 stream,
                                 scratch_realloc_counter);
 
-    const int total_len = append_kv_cache<Traits>(impl,
-                                                  sample_ids,
-                                                  shape.batch,
-                                                  shape.seq_len,
-                                                  params.num_heads_kv,
-                                                  params.head_dim,
-                                                  scratch.k,
-                                                  scratch.v,
-                                                  stream);
+    const ActiveCacheInfo active_cache = append_kv_cache<Traits>(impl,
+                                                                  sample_ids,
+                                                                  shape.batch,
+                                                                  shape.seq_len,
+                                                                  params.num_heads_kv,
+                                                                  params.head_dim,
+                                                                  scratch.k,
+                                                                  scratch.v,
+                                                                  stream);
+    const int total_len = active_cache.max_len;
     if (total_len <= 0) {
         throw std::runtime_error("self_attn_forward_cuda: cache length is zero after append.");
+    }
+    for (int len : active_cache.active_lens) {
+        if (len != total_len) {
+            throw std::invalid_argument("self_attn_forward_cuda: prefill path requires uniform active cache lengths.");
+        }
     }
 
     const CacheBatchView cache_view = prepare_cache_batch_view<Traits>(

@@ -28,6 +28,16 @@ public:
     ~GptModel();
 
     std::string forward(const std::vector<std::vector<int>>& input);
+    void start_continuous(int initial_cache_slots);
+    void set_continuous_pad_lens(const std::vector<int>& pad_lens);
+    std::vector<int> sample_prefill_continuous(const std::vector<int>& sample_ids,
+                                               const std::vector<std::vector<int>>& input_tokens,
+                                               const std::vector<int>& pos_offsets);
+    std::vector<int> sample_decode_continuous(const std::vector<int>& sample_ids,
+                                              const std::vector<std::vector<int>>& input_tokens,
+                                              const std::vector<int>& pos_offsets);
+    void clear_continuous_sample(int sample_id);
+    void reset_continuous();
 
 private:
     struct GenerationContext;
@@ -45,6 +55,8 @@ private:
     std::vector<int> sample_and_record_last_token(GenerationContext& ctx,
                                                   const std::pair<std::vector<float>, std::vector<int>>& output_info,
                                                   int step);
+    std::vector<int> sample_tokens_from_output(const std::pair<std::vector<float>, std::vector<int>>& output_info,
+                                               int token_index);
     void decode(GenerationContext& ctx);
     void apply_eos_filter_and_update_state(GenerationContext& ctx);
     void filter_eos_samples(GenerationContext& ctx);

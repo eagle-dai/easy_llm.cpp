@@ -239,17 +239,20 @@ Tensor SelfAttn::forward_cpu(const Tensor& input, const std::vector<int>& sample
     append_kv_cache(k, v, ctx);
     auto cache_k_batch = build_active_cache(cache_k_by_sample_, ctx);
     auto cache_v_batch = build_active_cache(cache_v_by_sample_, ctx);
-    validate_tensor_size(cache_k_batch, "cache_k_batch");
-    validate_tensor_size(cache_v_batch, "cache_v_batch");
-    cache_k_batch.transpose(2, 3);  // [batch, num_head, head_dim, seq]
+    if (cache_k_batch.valid_lens != cache_v_batch.valid_lens) {
+        throw std::invalid_argument("forward_cpu: K/V active cache lengths mismatch.");
+    }
+    validate_tensor_size(cache_k_batch.cache, "cache_k_batch");
+    validate_tensor_size(cache_v_batch.cache, "cache_v_batch");
+    cache_k_batch.cache.transpose(2, 3);  // [batch, num_head, head_dim, seq]
 
     int seq_len = q.shape()[2];
     ctx.seq_len = seq_len;
-    auto scores = ops::matmul_4d(q, cache_k_batch);  // [batch, num_head, seq, seq]
-    apply_attention_masks(scores, ctx);
+    auto scores = ops::matmul_4d(q, cache_k_batch.cache);  // [batch, num_head, seq, seq]
+    apply_attention_masks(scores, ctx, cache_k_batch.valid_lens);
     scores.scale_inplace(1.0f / std::sqrt(head_dim_));  // scale scores
     auto attention = scores.softmax();
-    auto attn_output = ops::matmul_4d(attention, cache_v_batch);  // [batch, num_head, seq, head_dim]
+    auto attn_output = ops::matmul_4d(attention, cache_v_batch.cache);  // [batch, num_head, seq, head_dim]
     auto input_shape = input.shape();
     attn_output.transpose(1, 2).reshape(input_shape);
     auto output = o_proj_.forward(attn_output);
@@ -323,11 +326,14 @@ void SelfAttn::expand_kv_heads(Tensor& k, Tensor& v) {
     v.repeat(num_heads_ / num_heads_kv_, 1);  // [batch, num_head_kv, seq, head_dim]
 }
 
-void SelfAttn::apply_attention_masks(Tensor& scores, const ForwardContext& ctx) const {
+void SelfAttn::apply_attention_masks(Tensor& scores,
+                                     const ForwardContext& ctx,
+                                     const std::vector<int>& valid_lens) const {
     int total_len = scores.shape()[3];
     if (ctx.seq_len > 1) {
         apply_causal_mask(scores, ctx.seq_len, total_len);
     }
+    apply_valid_length_mask(scores, valid_lens);
     if (!pad_lens_by_sample_.empty()) {
         apply_padding_mask(scores, ctx.sample_ids, pad_lens_by_sample_);
     }
@@ -382,47 +388,9 @@ void SelfAttn::append_kv_cache(const Tensor& k, const Tensor& v, const ForwardCo
     }
 }
 
-Tensor SelfAttn::build_active_cache(const std::vector<Tensor>& cache_by_sample, const ForwardContext& ctx) const {
-    if (ctx.sample_ids.size() == 1) {
-        int sample_id = ctx.sample_ids[0];
-        if (sample_id < 0 || sample_id >= static_cast<int>(cache_by_sample.size())) {
-            throw std::out_of_range("build_active_cache: sample_id out of range.");
-        }
-        const Tensor& single = cache_by_sample[sample_id];
-        return single;
-    }
-    int first_sample_id = ctx.sample_ids[0];
-    if (first_sample_id < 0 || first_sample_id >= static_cast<int>(cache_by_sample.size())) {
-        throw std::out_of_range("build_active_cache: sample_id out of range.");
-    }
-
-    const Tensor& first = cache_by_sample[first_sample_id];
-    const auto& shape = first.shape();
-    if (shape.size() != 4 || shape[0] != 1) {
-        throw std::invalid_argument("build_active_cache expects per-sample cache with shape [1, heads, seq, dim].");
-    }
-    int batch = static_cast<int>(ctx.sample_ids.size());
-    int num_heads = shape[1];
-    int seq_len = shape[2];
-    int head_dim = shape[3];
-    int block = num_heads * seq_len * head_dim;
-
-    Tensor output(batch * block, {batch, num_heads, seq_len, head_dim});
-    auto& dst = output.data();
-    for (int i = 0; i < batch; ++i) {
-        int sample_id = ctx.sample_ids[i];
-        if (sample_id < 0 || sample_id >= static_cast<int>(cache_by_sample.size())) {
-            throw std::out_of_range("build_active_cache: sample_id out of range.");
-        }
-        const Tensor& src_tensor = cache_by_sample[sample_id];
-        if (src_tensor.shape() != shape) {
-            throw std::invalid_argument("build_active_cache: per-sample cache shape mismatch.");
-        }
-        const auto& src = src_tensor.data();
-        int start = i * block;
-        std::copy(src.begin(), src.end(), dst.begin() + start);
-    }
-    return output;
+BatchedCacheView SelfAttn::build_active_cache(const std::vector<Tensor>& cache_by_sample,
+                                              const ForwardContext& ctx) const {
+    return build_padded_active_cache(cache_by_sample, ctx.sample_ids);
 }
 
 void SelfAttn::ensure_cache_capacity(int min_size) {
@@ -450,6 +418,17 @@ void SelfAttn::reset_kv_cache() {
 
 void SelfAttn::set_pad_lens(const std::vector<int>& pad_lens) {
     pad_lens_by_sample_ = pad_lens;
+}
+
+void SelfAttn::set_cuda_enabled(bool enabled) {
+#ifdef USE_CUDA
+    cuda_enabled_ = enabled;
+    if (!enabled && cuda_state_) {
+        cuda_state_->reset_kv_cache();
+    }
+#else
+    (void)enabled;
+#endif
 }
 
 } // namespace easy_llm

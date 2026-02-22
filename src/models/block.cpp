@@ -44,4 +44,8 @@ void Block::set_pad_lens(const std::vector<int>& pad_lens) {
     self_attn_.set_pad_lens(pad_lens);
 }
 
+void Block::set_self_attn_cuda_enabled(bool enabled) {
+    self_attn_.set_cuda_enabled(enabled);
+}
+
 } // namespace easy_llm

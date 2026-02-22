@@ -94,12 +94,53 @@ add_executable(easy_llm_rope_test test/rope_test.cpp)
 target_link_libraries(easy_llm_rope_test PRIVATE easy_llm_core)
 add_test(NAME easy_llm_rope_test COMMAND easy_llm_rope_test)
 
+add_executable(easy_llm_cache_batching_test test/cache_batching_test.cpp)
+target_link_libraries(easy_llm_cache_batching_test PRIVATE easy_llm_core)
+add_test(NAME easy_llm_cache_batching_test COMMAND easy_llm_cache_batching_test)
+set_tests_properties(easy_llm_cache_batching_test PROPERTIES LABELS "invariant_gate")
+
+add_executable(easy_llm_cache_batching_invariants_test test/cache_batching_invariants_test.cpp)
+target_link_libraries(easy_llm_cache_batching_invariants_test PRIVATE easy_llm_core)
+add_test(NAME easy_llm_cache_batching_invariants_test COMMAND easy_llm_cache_batching_invariants_test)
+set_tests_properties(easy_llm_cache_batching_invariants_test PROPERTIES LABELS "invariant_gate")
+
+add_executable(easy_llm_data_manager_invariants_test test/data_manager_invariants_test.cpp)
+target_link_libraries(easy_llm_data_manager_invariants_test PRIVATE easy_llm_core)
+add_test(NAME easy_llm_data_manager_invariants_test COMMAND easy_llm_data_manager_invariants_test)
+set_tests_properties(easy_llm_data_manager_invariants_test PROPERTIES LABELS "invariant_gate")
+
+add_executable(easy_llm_generation_invariants_test test/generation_invariants_test.cpp)
+target_link_libraries(easy_llm_generation_invariants_test PRIVATE easy_llm_core)
+add_test(NAME easy_llm_generation_invariants_test COMMAND easy_llm_generation_invariants_test)
+set_tests_properties(easy_llm_generation_invariants_test PROPERTIES LABELS "invariant_gate")
+
+add_executable(easy_llm_cli_options_test test/cli_options_test.cpp)
+target_link_libraries(easy_llm_cli_options_test PRIVATE easy_llm_core)
+add_test(NAME easy_llm_cli_options_test COMMAND easy_llm_cli_options_test)
+
 if(EASY_LLM_ENABLE_CUDA)
     add_executable(easy_llm_self_attn_cuda_test test/self_attn_cuda_test.cpp)
     target_link_libraries(easy_llm_self_attn_cuda_test PRIVATE easy_llm_core)
     add_test(NAME easy_llm_self_attn_cuda_test COMMAND easy_llm_self_attn_cuda_test)
+    set_tests_properties(easy_llm_self_attn_cuda_test PROPERTIES LABELS "invariant_gate_cuda")
+
+    add_executable(easy_llm_self_attn_cuda_varlen_test test/self_attn_cuda_varlen_test.cpp)
+    target_link_libraries(easy_llm_self_attn_cuda_varlen_test PRIVATE easy_llm_core)
+    add_test(NAME easy_llm_self_attn_cuda_varlen_test COMMAND easy_llm_self_attn_cuda_varlen_test)
+    set_tests_properties(easy_llm_self_attn_cuda_varlen_test PROPERTIES LABELS "invariant_gate_cuda")
 
     add_executable(easy_llm_mlp_cuda_test test/mlp_cuda_test.cpp)
     target_link_libraries(easy_llm_mlp_cuda_test PRIVATE easy_llm_core)
     add_test(NAME easy_llm_mlp_cuda_test COMMAND easy_llm_mlp_cuda_test)
 endif()
+
+add_custom_target(easy_llm_regression_gates
+    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure -L "^invariant_gate$"
+    DEPENDS
+        easy_llm_cache_batching_test
+        easy_llm_cache_batching_invariants_test
+        easy_llm_data_manager_invariants_test
+        easy_llm_generation_invariants_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    USES_TERMINAL
+)

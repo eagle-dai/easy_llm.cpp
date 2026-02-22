@@ -28,6 +28,7 @@ public:
     void clear_kv_cache(int sample_id);
     void reset_kv_cache();
     void set_pad_lens(const std::vector<int>& pad_lens);
+    void set_self_attn_cuda_enabled(bool enabled);
 
 private:
     SelfAttn self_attn_;

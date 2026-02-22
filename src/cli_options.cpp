@@ -23,6 +23,7 @@ std::string trim(const std::string& text) {
 void print_usage(std::ostream& os) {
     os << "Usage: easy_llm [--prompt-file <path>] [--max-steps <n>]\n"
           "                [--temperature <float>] [--top-p <float>] [--top-k <int>] [--seed <int>] [--greedy]\n"
+          "                [--serve] [--serve-max-active <n>] [--serve-prefill-batch <n>] [--serve-idle-ms <n>] [--serve-stats-ms <n>]\n"
           "                [\"prompt\"]\n"
        << "  -f, --prompt-file <path>  Read prompts from file (one per line, ignore empty lines)\n"
        << "  -m, --max-steps <n>        Maximum generation steps per request (default: 100)\n"
@@ -31,12 +32,18 @@ void print_usage(std::ostream& os) {
        << "      --top-k <int>          Top-K sampling cutoff, 0 disables (default: 20)\n"
        << "      --seed <int>           RNG seed for sampling (default: 42)\n"
        << "      --greedy               Use greedy decoding (override sampling)\n"
+       << "      --serve                Run as long-lived continuous batching service\n"
+       << "      --serve-max-active <n> Max concurrent active requests in service mode (default: 16)\n"
+       << "      --serve-prefill-batch <n> Max requests admitted per prefill round (default: 4)\n"
+       << "      --serve-idle-ms <n>    Service idle sleep in milliseconds (default: 2)\n"
+       << "      --serve-stats-ms <n>   Service stats log interval in milliseconds, 0 disables periodic logs (default: 1000)\n"
        << "  -h, --help                Show this help message\n"
        << "Examples:\n"
        << "  ./build/easy_llm --max-steps 128 \"Hello\"\n"
        << "  ./build/easy_llm --temperature 0.7 --top-p 0.9 --top-k 40 \"Hello\"\n"
        << "  ./build/easy_llm --greedy \"Hello\"\n"
-       << "  ./build/easy_llm -f test/data/prompts.txt\n";
+       << "  ./build/easy_llm -f test/data/prompts.txt\n"
+       << "  ./build/easy_llm --serve\n";
 }
 
 std::string apply_chat_template(const std::string& user_query) {
@@ -187,6 +194,82 @@ bool parse_args(int argc, char** argv, CliOptions* options, std::string* error) 
         }
         if (arg == "--greedy") {
             options->use_greedy = true;
+            continue;
+        }
+        if (arg == "--serve") {
+            options->serve = true;
+            continue;
+        }
+        if (arg == "--serve-max-active") {
+            if (i + 1 >= argc) {
+                *error = "Missing number after " + arg;
+                return false;
+            }
+            std::string value = argv[++i];
+            try {
+                options->serve_max_active = std::stoi(value);
+            } catch (const std::exception&) {
+                *error = "Invalid number for serve max active: " + value;
+                return false;
+            }
+            if (options->serve_max_active <= 0) {
+                *error = "serve-max-active must be greater than 0";
+                return false;
+            }
+            continue;
+        }
+        if (arg == "--serve-prefill-batch") {
+            if (i + 1 >= argc) {
+                *error = "Missing number after " + arg;
+                return false;
+            }
+            std::string value = argv[++i];
+            try {
+                options->serve_prefill_batch = std::stoi(value);
+            } catch (const std::exception&) {
+                *error = "Invalid number for serve prefill batch: " + value;
+                return false;
+            }
+            if (options->serve_prefill_batch <= 0) {
+                *error = "serve-prefill-batch must be greater than 0";
+                return false;
+            }
+            continue;
+        }
+        if (arg == "--serve-idle-ms") {
+            if (i + 1 >= argc) {
+                *error = "Missing number after " + arg;
+                return false;
+            }
+            std::string value = argv[++i];
+            try {
+                options->serve_idle_ms = std::stoi(value);
+            } catch (const std::exception&) {
+                *error = "Invalid number for serve idle ms: " + value;
+                return false;
+            }
+            if (options->serve_idle_ms < 0) {
+                *error = "serve-idle-ms must be >= 0";
+                return false;
+            }
+            continue;
+        }
+        if (arg == "--serve-stats-ms") {
+            if (i + 1 >= argc) {
+                *error = "Missing number after " + arg;
+                return false;
+            }
+            std::string value = argv[++i];
+            try {
+                options->serve_stats_ms = std::stoi(value);
+            } catch (const std::exception&) {
+                *error = "Invalid number for serve stats ms: " + value;
+                return false;
+            }
+            if (options->serve_stats_ms < 0) {
+                *error = "serve-stats-ms must be >= 0";
+                return false;
+            }
             continue;
         }
         if (!arg.empty() && arg[0] == '-') {
