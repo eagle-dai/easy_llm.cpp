@@ -27,7 +27,7 @@ Embedding::Embedding(int vocab_size, int embedding_dim, std::vector<data_type>& 
 }
 
 void Embedding::load_param(ModelParam& model_param) {
-    weights_ = model_param.get_param("model.embed_tokens.weight");
+    weights_ = model_param.take_param("model.embed_tokens.weight");
     vocab_size_ = weights_.shape()[0];
     embedding_dim_ = weights_.shape()[1];
     spdlog::info("Embedding layer loaded: vocab_size = {}, embedding_dim = {}", vocab_size_, embedding_dim_);

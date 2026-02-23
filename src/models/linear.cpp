@@ -24,11 +24,11 @@ Linear::Linear(int out_dim, int in_dim): out_dim_(out_dim), in_dim_(in_dim) {
 }
 
 void Linear::load_param(const std::string& key, ModelParam& model_param) {
-    weights_ = model_param.get_param(key + ".weight");
+    weights_ = model_param.take_param(key + ".weight");
     out_dim_ = weights_.shape()[0];
     in_dim_ = weights_.shape()[1];
     if (model_param.contains(key + ".bias")) {
-        bias_ = model_param.get_param(key + ".bias");
+        bias_ = model_param.take_param(key + ".bias");
         bias_.reshape({bias_.size()});  // ori shape is {bias_.size(), 1}; due to GQA, bias_.size() might not equal in_dim_
     } else {
         bias_.resize(out_dim_);

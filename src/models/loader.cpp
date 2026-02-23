@@ -134,12 +134,24 @@ void ModelParam::load_from_ckpt(const string& path) {
     finalize_log(params_);
 }
 
-Tensor ModelParam::get_param(const string& key) {
-    if (!contains(key)) {
-        spdlog::error("Key not found in ModelParam::get_param: {}", key);
-        throw std::out_of_range("Key not found in ModelParam::get_param");
+Tensor ModelParam::take_param(const string& key) {
+    auto it = params_.find(key);
+    if (it == params_.end()) {
+        spdlog::error("Key not found in ModelParam::take_param: {}", key);
+        throw std::out_of_range("Key not found in ModelParam::take_param: " + key);
     }
-    return move(params_[key]);
+    Tensor value = std::move(it->second);
+    params_.erase(it);
+    return value;
+}
+
+const Tensor& ModelParam::peek_param(const string& key) const {
+    auto it = params_.find(key);
+    if (it == params_.end()) {
+        spdlog::error("Key not found in ModelParam::peek_param: {}", key);
+        throw std::out_of_range("Key not found in ModelParam::peek_param: " + key);
+    }
+    return it->second;
 }
 
 bool ModelParam::contains(const string& key) const {

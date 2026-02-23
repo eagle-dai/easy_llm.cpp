@@ -13,6 +13,7 @@
 #include "ops.hpp"
 #include "sampler.hpp"
 #include "models/layer_key_prefix.hpp"
+#include "models/model_param_validation.hpp"
 #include "models/generation_invariants.hpp"
 
 namespace easy_llm {
@@ -142,6 +143,7 @@ void GptModel::init_from_config() {
 }
 
 void GptModel::load_param(ModelParam& model_param) {
+    validate_model_params_before_load(config_, *layer_key_prefix_, model_param);
     embedding_->load_param(model_param);
     for (int i = 0; i < num_blocks_; ++i) {
         blocks_[i]->load_param(*layer_key_prefix_, layer_key_prefix_->layer(i), model_param);

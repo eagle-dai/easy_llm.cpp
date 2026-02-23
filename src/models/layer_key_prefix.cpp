@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 #include <spdlog/spdlog.h>
@@ -93,12 +94,14 @@ std::unique_ptr<LayerKeyPrefix> create_layer_key_prefix(const Config& config) {
         spdlog::info("LayerKeyPrefix selected: Qwen2 family");
         return std::make_unique<Qwen2_5_LayerKeyPrefix>();
     }
-    spdlog::warn(
-        "Unknown model architecture/model_type (architecture='{}', model_type='{}'), fallback to Qwen2 key prefix rules.",
+    spdlog::error(
+        "Unknown model architecture/model_type (architecture='{}', model_type='{}').",
         config.architecture,
         config.model_type
     );
-    return std::make_unique<Qwen2_5_LayerKeyPrefix>();
+    throw std::invalid_argument(
+        "Unsupported model architecture/model_type for LayerKeyPrefix: architecture='" + config.architecture +
+        "', model_type='" + config.model_type + "'");
 }
 
 } // namespace easy_llm

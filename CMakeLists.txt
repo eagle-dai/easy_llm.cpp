@@ -118,6 +118,14 @@ add_executable(easy_llm_cli_options_test test/cli_options_test.cpp)
 target_link_libraries(easy_llm_cli_options_test PRIVATE easy_llm_core)
 add_test(NAME easy_llm_cli_options_test COMMAND easy_llm_cli_options_test)
 
+add_executable(easy_llm_layer_key_prefix_test test/layer_key_prefix_test.cpp)
+target_link_libraries(easy_llm_layer_key_prefix_test PRIVATE easy_llm_core)
+add_test(NAME easy_llm_layer_key_prefix_test COMMAND easy_llm_layer_key_prefix_test)
+
+add_executable(easy_llm_model_param_validation_test test/model_param_validation_test.cpp)
+target_link_libraries(easy_llm_model_param_validation_test PRIVATE easy_llm_core)
+add_test(NAME easy_llm_model_param_validation_test COMMAND easy_llm_model_param_validation_test)
+
 if(EASY_LLM_ENABLE_CUDA)
     add_executable(easy_llm_self_attn_cuda_test test/self_attn_cuda_test.cpp)
     target_link_libraries(easy_llm_self_attn_cuda_test PRIVATE easy_llm_core)

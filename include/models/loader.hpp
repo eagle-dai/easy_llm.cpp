@@ -15,7 +15,8 @@ class ModelParam {
 public:
     static std::unique_ptr<ModelParam> load(const std::string& model_path);
     ModelParam();
-    Tensor get_param(const std::string& key);
+    Tensor take_param(const std::string& key);
+    const Tensor& peek_param(const std::string& key) const;
     bool contains(const std::string& key) const;
 
 private:

@@ -17,7 +17,7 @@ RMSNorm::RMSNorm() {}
 
 void RMSNorm::load_param(const string& key, ModelParam& model_param) {
     if (model_param.contains(key + ".weight")) {
-        weight_ = model_param.get_param(key + ".weight");  
+        weight_ = model_param.take_param(key + ".weight");
         if (weight_.shape().empty()) {
             throw std::runtime_error("Loaded weight tensor is empty for key: " + key);
         }
