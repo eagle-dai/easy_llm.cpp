@@ -1,4 +1,6 @@
 #include <cstdint>
+#include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -16,23 +18,130 @@
 
 namespace {
 
+enum class FixtureDType {
+    Bf16,
+    F16,
+    F32,
+    I8
+};
+
 struct TensorSpec {
     std::string key;
     std::vector<int> shape;
     float fill_value;
+    FixtureDType dtype{FixtureDType::Bf16};
 };
 
-std::vector<easy_llm::data_type> build_tensor_data(const std::vector<int>& shape, float fill_value) {
-    int total = 1;
+std::size_t count_elements(const std::vector<int>& shape) {
+    std::size_t total = 1;
     for (int dim : shape) {
-        total *= dim;
+        if (dim <= 0) {
+            throw std::runtime_error("Fixture shape contains non-positive dimension.");
+        }
+        total *= static_cast<std::size_t>(dim);
     }
-    std::vector<easy_llm::data_type> data;
-    data.reserve(total);
-    for (int i = 0; i < total; ++i) {
-        data.emplace_back(easy_llm::data_type(fill_value + static_cast<float>(i) * 0.001f));
+    return total;
+}
+
+const char* to_dtype_name(FixtureDType dtype) {
+    switch (dtype) {
+        case FixtureDType::Bf16: return "BF16";
+        case FixtureDType::F16: return "F16";
+        case FixtureDType::F32: return "F32";
+        case FixtureDType::I8: return "I8";
+        default: throw std::runtime_error("Unsupported fixture dtype.");
     }
-    return data;
+}
+
+std::size_t dtype_bytes(FixtureDType dtype) {
+    switch (dtype) {
+        case FixtureDType::Bf16: return sizeof(std::uint16_t);
+        case FixtureDType::F16: return sizeof(std::uint16_t);
+        case FixtureDType::F32: return sizeof(float);
+        case FixtureDType::I8: return sizeof(std::int8_t);
+        default: throw std::runtime_error("Unsupported fixture dtype.");
+    }
+}
+
+std::uint16_t float_to_fp16_bits(float value) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    std::uint32_t sign = (bits >> 16) & 0x8000u;
+    int exp = static_cast<int>((bits >> 23) & 0xFFu) - 127 + 15;
+    std::uint32_t mantissa = bits & 0x7FFFFFu;
+
+    if (exp <= 0) {
+        if (exp < -10) {
+            return static_cast<std::uint16_t>(sign);
+        }
+        mantissa |= 0x800000u;
+        const int shift = 14 - exp;
+        std::uint32_t half_mantissa = mantissa >> shift;
+        std::uint32_t round_bit = (mantissa >> (shift - 1)) & 1u;
+        std::uint32_t sticky_bits = mantissa & ((1u << (shift - 1)) - 1u);
+        if (round_bit && (sticky_bits || (half_mantissa & 1u))) {
+            ++half_mantissa;
+        }
+        return static_cast<std::uint16_t>(sign | half_mantissa);
+    }
+
+    if (exp >= 31) {
+        return static_cast<std::uint16_t>(sign | 0x7C00u);
+    }
+
+    std::uint16_t half_mantissa = static_cast<std::uint16_t>(mantissa >> 13);
+    std::uint32_t round_bits = mantissa & 0x1FFFu;
+    if (round_bits > 0x1000u || (round_bits == 0x1000u && (half_mantissa & 1u))) {
+        ++half_mantissa;
+        if (half_mantissa == 0x0400u) {
+            half_mantissa = 0;
+            ++exp;
+            if (exp >= 31) {
+                return static_cast<std::uint16_t>(sign | 0x7C00u);
+            }
+        }
+    }
+    return static_cast<std::uint16_t>(sign | (static_cast<std::uint16_t>(exp) << 10) | half_mantissa);
+}
+
+template <typename T>
+void append_scalar(std::vector<char>& bytes, T value) {
+    const char* ptr = reinterpret_cast<const char*>(&value);
+    bytes.insert(bytes.end(), ptr, ptr + sizeof(T));
+}
+
+std::vector<char> build_tensor_blob(const TensorSpec& spec) {
+    const std::size_t total = count_elements(spec.shape);
+    std::vector<char> bytes;
+    bytes.reserve(total * dtype_bytes(spec.dtype));
+
+    for (std::size_t i = 0; i < total; ++i) {
+        const float value = spec.fill_value + static_cast<float>(i) * 0.001f;
+        switch (spec.dtype) {
+            case FixtureDType::Bf16: {
+                const std::uint16_t encoded = easy_llm::float_to_bf16(value);
+                append_scalar(bytes, encoded);
+                break;
+            }
+            case FixtureDType::F16: {
+                const std::uint16_t encoded = float_to_fp16_bits(value);
+                append_scalar(bytes, encoded);
+                break;
+            }
+            case FixtureDType::F32: {
+                append_scalar(bytes, value);
+                break;
+            }
+            case FixtureDType::I8: {
+                const std::int8_t encoded = static_cast<std::int8_t>(value);
+                append_scalar(bytes, encoded);
+                break;
+            }
+            default:
+                throw std::runtime_error("Unsupported fixture dtype.");
+        }
+    }
+    return bytes;
 }
 
 std::filesystem::path write_safetensors_fixture(const std::string& filename,
@@ -42,20 +151,20 @@ std::filesystem::path write_safetensors_fixture(const std::string& filename,
     std::uint64_t data_offset = 0;
 
     for (const auto& spec : specs) {
-        std::vector<easy_llm::data_type> data = build_tensor_data(spec.shape, spec.fill_value);
-        std::size_t bytes = data.size() * sizeof(easy_llm::data_type);
+        std::vector<char> data = build_tensor_blob(spec);
+        std::size_t bytes = data.size();
 
         std::uint64_t begin = data_offset;
         std::uint64_t end = data_offset + static_cast<std::uint64_t>(bytes);
         data_offset = end;
 
         header[spec.key] = {
-            {"dtype", "BF16"},
+            {"dtype", to_dtype_name(spec.dtype)},
             {"shape", spec.shape},
             {"data_offsets", {begin, end}}
         };
 
-        const char* ptr = reinterpret_cast<const char*>(data.data());
+        const char* ptr = data.data();
         binary_blob.insert(binary_blob.end(), ptr, ptr + bytes);
     }
 
@@ -170,6 +279,80 @@ bool run_take_and_peek_contract_case() {
     return true;
 }
 
+bool run_loader_preserves_rank_case() {
+    std::vector<TensorSpec> specs{
+        {"model.embed_tokens.weight", {2, 3, 4}, 0.5f}
+    };
+    std::filesystem::path path = write_safetensors_fixture("easy_llm_loader_rank3.safetensors", specs);
+    auto model_param = easy_llm::ModelParam::load(path.string());
+
+    const auto& tensor = model_param->peek_param("model.embed_tokens.weight");
+    if (tensor.shape() != std::vector<int>({2, 3, 4})) {
+        std::cerr << "FAIL: loader should preserve original tensor rank\n";
+        return false;
+    }
+    return true;
+}
+
+bool almost_equal(float lhs, float rhs, float abs_tol = 1e-2f) {
+    return std::fabs(lhs - rhs) <= abs_tol;
+}
+
+bool run_loader_f32_conversion_case() {
+    std::vector<TensorSpec> specs{
+        {"model.embed_tokens.weight", {2, 2}, 1.25f, FixtureDType::F32}
+    };
+    std::filesystem::path path = write_safetensors_fixture("easy_llm_loader_f32.safetensors", specs);
+    auto model_param = easy_llm::ModelParam::load(path.string());
+    const auto& tensor = model_param->peek_param("model.embed_tokens.weight");
+    if (tensor.shape() != std::vector<int>({2, 2})) {
+        std::cerr << "FAIL: F32 conversion shape mismatch\n";
+        return false;
+    }
+    if (!almost_equal(static_cast<float>(tensor.at(0)), 1.25f, 2e-2f)) {
+        std::cerr << "FAIL: F32 conversion value mismatch at index 0\n";
+        return false;
+    }
+    if (!almost_equal(static_cast<float>(tensor.at(3)), 1.253f, 2e-2f)) {
+        std::cerr << "FAIL: F32 conversion value mismatch at index 3\n";
+        return false;
+    }
+    return true;
+}
+
+bool run_loader_f16_conversion_case() {
+    std::vector<TensorSpec> specs{
+        {"model.embed_tokens.weight", {2, 2}, -0.75f, FixtureDType::F16}
+    };
+    std::filesystem::path path = write_safetensors_fixture("easy_llm_loader_f16.safetensors", specs);
+    auto model_param = easy_llm::ModelParam::load(path.string());
+    const auto& tensor = model_param->peek_param("model.embed_tokens.weight");
+    if (tensor.shape() != std::vector<int>({2, 2})) {
+        std::cerr << "FAIL: F16 conversion shape mismatch\n";
+        return false;
+    }
+    if (!almost_equal(static_cast<float>(tensor.at(0)), -0.75f, 2e-2f)) {
+        std::cerr << "FAIL: F16 conversion value mismatch at index 0\n";
+        return false;
+    }
+    if (!almost_equal(static_cast<float>(tensor.at(3)), -0.747f, 2e-2f)) {
+        std::cerr << "FAIL: F16 conversion value mismatch at index 3\n";
+        return false;
+    }
+    return true;
+}
+
+bool run_loader_unsupported_dtype_case() {
+    std::vector<TensorSpec> specs{
+        {"model.embed_tokens.weight", {4, 1}, 2.0f, FixtureDType::I8}
+    };
+    std::filesystem::path path = write_safetensors_fixture("easy_llm_loader_i8.safetensors", specs);
+    return expect_throws<std::runtime_error>([&]() {
+        auto model_param = easy_llm::ModelParam::load(path.string());
+        (void)model_param;
+    }, "loader unsupported dtype");
+}
+
 bool run_validation_success_case() {
     auto specs = make_complete_specs();
     std::filesystem::path path = write_safetensors_fixture("easy_llm_model_param_valid.safetensors", specs);
@@ -246,6 +429,18 @@ bool run_remaining_keys_fail_case() {
 
 int main() {
     if (!run_take_and_peek_contract_case()) {
+        return 1;
+    }
+    if (!run_loader_preserves_rank_case()) {
+        return 1;
+    }
+    if (!run_loader_f32_conversion_case()) {
+        return 1;
+    }
+    if (!run_loader_f16_conversion_case()) {
+        return 1;
+    }
+    if (!run_loader_unsupported_dtype_case()) {
         return 1;
     }
     if (!run_validation_success_case()) {
