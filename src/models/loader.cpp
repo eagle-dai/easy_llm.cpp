@@ -1,5 +1,6 @@
 #include "models/loader.hpp"
 
+#include <algorithm>
 #include <random>
 #include <fstream>
 #include <sys/mman.h>
@@ -160,6 +161,21 @@ bool ModelParam::contains(const string& key) const {
         return true;
     }
     return false;
+}
+
+std::vector<std::string> ModelParam::remaining_keys() const {
+    std::vector<std::string> keys;
+    keys.reserve(params_.size());
+    for (const auto& [key, _] : params_) {
+        (void)_;
+        keys.push_back(key);
+    }
+    std::sort(keys.begin(), keys.end());
+    return keys;
+}
+
+std::size_t ModelParam::size() const {
+    return params_.size();
 }
 
 }  // namespace easy_llm

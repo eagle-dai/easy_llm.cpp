@@ -149,6 +149,7 @@ void GptModel::load_param(ModelParam& model_param) {
         blocks_[i]->load_param(*layer_key_prefix_, layer_key_prefix_->layer(i), model_param);
     }
     norm_.load_param(layer_key_prefix_->model_norm(), model_param);
+    validate_no_remaining_model_params(model_param);
 }
 
 string GptModel::forward(const vector<vector<int>>& input) {

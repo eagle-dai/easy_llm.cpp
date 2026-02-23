@@ -10,6 +10,7 @@ class ModelParam;
 void validate_model_params_before_load(const Config& config,
                                        const LayerKeyPrefix& key_prefix,
                                        const ModelParam& model_param);
+void validate_no_remaining_model_params(const ModelParam& model_param);
 
 } // namespace easy_llm
 

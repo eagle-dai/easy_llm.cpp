@@ -1,10 +1,13 @@
 #include "models/model_param_validation.hpp"
 
+#include <algorithm>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <spdlog/spdlog.h>
 
 #include "config.hpp"
 #include "models/layer_key_prefix.hpp"
@@ -190,6 +193,28 @@ void validate_model_params_before_load(const Config& config,
                                         std::to_string(down_shape[1]) + ", up_out=" + std::to_string(up_shape[0]));
         }
     }
+}
+
+void validate_no_remaining_model_params(const ModelParam& model_param) {
+    std::vector<std::string> remaining = model_param.remaining_keys();
+    if (remaining.empty()) {
+        return;
+    }
+
+    constexpr std::size_t kPreviewLimit = 20;
+    const std::size_t preview_size = std::min(remaining.size(), kPreviewLimit);
+    std::vector<std::string> preview(remaining.begin(), remaining.begin() + preview_size);
+    const std::string suffix =
+        remaining.size() > kPreviewLimit
+            ? " ... (+" + std::to_string(remaining.size() - kPreviewLimit) + " more)"
+            : "";
+
+    const std::string preview_text = join_keys(preview) + suffix;
+    spdlog::warn(
+        "Found {} unconsumed model weights after load (ignored): {}",
+        remaining.size(),
+        preview_text
+    );
 }
 
 } // namespace easy_llm

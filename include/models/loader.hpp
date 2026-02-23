@@ -2,6 +2,7 @@
 #define EASY_LLM_LOADER_HPP
 
 #include <array>
+#include <cstddef>
 #include <vector>
 #include <memory>
 #include <unordered_map>
@@ -18,6 +19,8 @@ public:
     Tensor take_param(const std::string& key);
     const Tensor& peek_param(const std::string& key) const;
     bool contains(const std::string& key) const;
+    std::vector<std::string> remaining_keys() const;
+    std::size_t size() const;
 
 private:
     void load_from_ckpt(const std::string& path);

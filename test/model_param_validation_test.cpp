@@ -105,6 +105,25 @@ std::vector<TensorSpec> make_complete_specs() {
     };
 }
 
+void consume_required_weights(const easy_llm::Config& config,
+                              const easy_llm::LayerKeyPrefix& key_prefix,
+                              easy_llm::ModelParam& model_param) {
+    (void)model_param.take_param("model.embed_tokens.weight");
+    for (int i = 0; i < config.num_layers; ++i) {
+        const std::string layer_key = key_prefix.layer(i);
+        (void)model_param.take_param(key_prefix.self_attn_q_proj(layer_key) + ".weight");
+        (void)model_param.take_param(key_prefix.self_attn_k_proj(layer_key) + ".weight");
+        (void)model_param.take_param(key_prefix.self_attn_v_proj(layer_key) + ".weight");
+        (void)model_param.take_param(key_prefix.self_attn_o_proj(layer_key) + ".weight");
+        (void)model_param.take_param(key_prefix.input_layer_norm(layer_key) + ".weight");
+        (void)model_param.take_param(key_prefix.mlp_down_proj(layer_key) + ".weight");
+        (void)model_param.take_param(key_prefix.mlp_gate_proj(layer_key) + ".weight");
+        (void)model_param.take_param(key_prefix.mlp_up_proj(layer_key) + ".weight");
+        (void)model_param.take_param(key_prefix.post_attention_layer_norm(layer_key) + ".weight");
+    }
+    (void)model_param.take_param(key_prefix.model_norm() + ".weight");
+}
+
 template <typename ExceptionType, typename Fn>
 bool expect_throws(Fn&& fn, const char* case_name) {
     try {
@@ -185,6 +204,44 @@ bool run_validation_bad_shape_case() {
     }, "validation bad shape");
 }
 
+bool run_remaining_keys_success_case() {
+    auto specs = make_complete_specs();
+    std::filesystem::path path = write_safetensors_fixture("easy_llm_model_param_remaining_ok.safetensors", specs);
+    auto model_param = easy_llm::ModelParam::load(path.string());
+    auto config = make_test_config();
+    auto key_prefix = easy_llm::create_layer_key_prefix(config);
+    easy_llm::validate_model_params_before_load(config, *key_prefix, *model_param);
+    consume_required_weights(config, *key_prefix, *model_param);
+    easy_llm::validate_no_remaining_model_params(*model_param);
+    if (model_param->size() != 0) {
+        std::cerr << "FAIL: remaining key count should be 0\n";
+        return false;
+    }
+    return true;
+}
+
+bool run_remaining_keys_fail_case() {
+    auto specs = make_complete_specs();
+    specs.push_back({"model.unused_adapter.weight", {2, 2}, 12.0f});
+    std::filesystem::path path = write_safetensors_fixture("easy_llm_model_param_remaining_bad.safetensors", specs);
+    auto model_param = easy_llm::ModelParam::load(path.string());
+    auto config = make_test_config();
+    auto key_prefix = easy_llm::create_layer_key_prefix(config);
+    easy_llm::validate_model_params_before_load(config, *key_prefix, *model_param);
+    consume_required_weights(config, *key_prefix, *model_param);
+    easy_llm::validate_no_remaining_model_params(*model_param);
+    if (model_param->size() != 1) {
+        std::cerr << "FAIL: remaining key count should be 1\n";
+        return false;
+    }
+    std::vector<std::string> remaining = model_param->remaining_keys();
+    if (remaining.size() != 1 || remaining[0] != "model.unused_adapter.weight") {
+        std::cerr << "FAIL: remaining key should be model.unused_adapter.weight\n";
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -198,6 +255,12 @@ int main() {
         return 1;
     }
     if (!run_validation_bad_shape_case()) {
+        return 1;
+    }
+    if (!run_remaining_keys_success_case()) {
+        return 1;
+    }
+    if (!run_remaining_keys_fail_case()) {
         return 1;
     }
     std::cout << "PASS: model param validation test\n";
