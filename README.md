@@ -2,29 +2,49 @@ English | [简体中文](README.zh-CN.md)
 
 # easy_llm
 
-A minimal C++ framework for learning and understanding the LLM inference pipeline. The project aims to be readable, easy to learn, and easy to modify, while preserving the key steps of a full inference flow (config loading, weight loading, tokenizer, prefill/decode, sampling and decoding). The default setup targets **Qwen2.5-0.5B**, so you can quickly run end-to-end inference on a single machine.
+A minimal C++ framework for learning and understanding the LLM inference pipeline. The project keeps the full inference path readable and editable: config loading, weight loading, tokenizer, prefill/decode, sampling, and decoding. The default setup targets **Qwen2.5-0.5B**, so you can run end-to-end inference quickly on a single machine.
 
-This project focuses on **architecture and the inference process**, not peak performance: operators are implemented with correctness and readability as the priority. Third-party dependencies are kept minimal (`spdlog` and `nlohmann/json`, both vendored in the repo); everything else is implemented in C++, making it a good baseline for coursework, research prototypes, or personal learning.
+This project focuses on **correctness and architecture clarity**, not peak serving performance. Third-party dependencies are intentionally minimal (`spdlog` and `nlohmann/json`, both vendored); the rest is implemented in C++ and kept friendly for coursework, research prototypes, and self-study.
 
-## Updates
-- `dev/cuda` (CUDA operator development) has been merged into `release` and is in an early, just-started stage.
-- `release` remains CPU-first by default: `build.sh` does **not** enable CUDA. To build with CUDA, pass `-DEASY_LLM_ENABLE_CUDA=ON` (and CUDA arch) in CMake.
+## Status (as of 2026-02-23)
+- `release` now includes a **continuous batching service mode** (`--serve`) in addition to one-shot CLI inference.
+- **Regression/invariant tests** were expanded, with CTest labels and a dedicated target `easy_llm_regression_gates`.
+- Model loading now has stronger **architecture/key/shape validation** (including `LayerKeyPrefix` dispatch and parameter checks).
+- CUDA path has grown (matmul/MLP/self-attn kernels), while the project remains **CPU-first by default**.
 
 ---
 
 ## Quick Start
 
-### Dependencies & Build
+### Dependencies
 - A C++17 compiler
-- CMake (≥ 3.10)
-- Optional: OpenMP (the project can still build and run without it; enabling it can speed up some operators)
+- CMake (>= 3.10)
+- Optional: OpenMP (`EASY_LLM_ENABLE_OPENMP=ON` by default)
+- Optional: CUDA toolkit (only when building CUDA path)
+
+### Build (recommended commands)
+CPU build:
 
 ```bash
-bash build.sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=g++
+cmake --build build --target easy_llm -j8
 ```
 
-### Prepare Model Files 
-The default target is [**Qwen2.5-0.5B**](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct). Put the required files under the following path (`data/` is git-ignored):
+CUDA build (requires local CUDA env):
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DEASY_LLM_ENABLE_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=<your_arch> \
+  -DCMAKE_CXX_COMPILER=g++
+cmake --build build --target easy_llm -j8
+```
+
+`build.sh` is kept for local experiments and may contain machine-specific flags. Prefer the CMake commands above for portable usage.
+
+### Prepare Model Files
+The default target is [**Qwen2.5-0.5B**](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct). Put required files under (`data/` is git-ignored):
 
 ```
 data/model/
@@ -34,20 +54,33 @@ data/model/
 └─ tokenizer_config.json
 ```
 
-To customize paths, edit the default configuration in `include/config.hpp`.
+To customize paths, edit defaults in `include/config.hpp`.
 
 ### Run Examples
 ```bash
 ./build/easy_llm --help
 ./build/easy_llm --max-steps 128 --temperature 0.7 --top-p 0.9 --top-k 40 "Hello"
-./build/easy_llm --max-steps 256 --temperature 0.1 -f test/data/test_batch.txt
+./build/easy_llm -f test/data/test_batch.txt --max-steps 256 --temperature 0.1
+./build/easy_llm --serve
 ```
 
 Key arguments:
 - `-f/--prompt-file`: read multiple prompts from a file
-- `-m/--max-steps`: generation length limit
-- `--temperature`/`--top-p`/`--top-k`: sampling controls
+- `-m/--max-steps`: generation length limit per request
+- `--temperature` / `--top-p` / `--top-k`: sampling controls
+- `--seed`: RNG seed
 - `--greedy`: greedy decoding
+- `--serve`: run long-lived continuous batching service
+- `--serve-max-active`: max concurrent active requests in service mode
+- `--serve-prefill-batch`: max requests admitted per prefill round
+- `--serve-idle-ms`: idle sleep interval for the service loop
+- `--serve-stats-ms`: periodic stats log interval (0 disables periodic logs)
+
+### Continuous Batching Service Mode
+When running `./build/easy_llm --serve`:
+- Submit one prompt per input line in stdin.
+- Type `/quit` (or `:quit`) to stop accepting new input and drain existing requests.
+- Accepted requests print `[accepted <id>]`; completed requests print `[request <id>] <decoded_text>`.
 
 ---
 
@@ -55,71 +88,92 @@ Key arguments:
 
 ### Code Layout
 ```
-include/             # Public headers (core interfaces and data structures)
-include/models/      # GPT component definitions (Embedding/Attention/MLP/Block, etc.)
-include/third_party/ # Lightweight vendored headers (json.hpp, etc.)
-src/                 # Core implementations
-src/models/          # Model component implementations
-src/third_party/     # Vendored implementations (spdlog)
-test/                # Test scripts and data
-data/                # Model weights and tokenizer assets (git-ignored)
+include/                   # Public headers
+include/models/            # GPT component interfaces
+include/continuous_batch_server.hpp
+src/                       # Core implementations
+src/models/                # Model component implementations
+src/continuous_batch_server.cpp
+src/cuda/                  # CUDA runtime and CUDA operators
+test/                      # Unit/invariant tests and test data
+scripts/run_regression_gates.sh
+data/                      # Model assets (git-ignored)
 ```
 
-### Inference Flow (from the entry point)
-`src/main.cpp` orchestrates the full pipeline:
-1) Parse CLI arguments (prompt, sampling parameters, random seed, etc.)
-2) Read the prompt(s) or a prompt file and apply the chat template
-3) Load model config and weights (`config.json` + `model.safetensors`)
-4) Initialize `Tokenizer`, `DataManager`, and `GptModel`
-5) Build `GptEngine` and run `run` to generate outputs
+### Inference Flow (entry point)
+`src/main.cpp` orchestrates two runtime modes:
+1) Parse CLI arguments (prompt/sampling/service options)
+2) Load config + model weights + tokenizer
+3) Apply chat template to user prompts
+4) One-shot mode: `GptEngine::run` with `DataManager`
+5) Service mode: `ContinuousBatchServer::run` with prefill/decode rounds over active requests
 
-### GptModel Inference Logic (core path)
-- `DataManager` tokenizes the input and applies **left padding**, tracking each sample's `seq_len` and `pad_len`.
-- `GptModel::forward` creates a `GenerationContext`, initializes per-layer KV caches, and enters a **prefill → decode** two-stage process.
-- **Prefill**: run a full forward pass over the entire prompt in parallel: `Embedding → Block(Self-Attn+MLP)×N → RMSNorm → output projection`, then sample the first generated token from the logits at the last position.
-- **Decode**: iteratively feed only the token generated in the previous step, append attention context via the KV cache, sample the next token, update the position index, and check EOS. On EOS, the sample's KV cache is cleared and the sample is removed from the active batch.
-- Generated tokens are recorded by `DataManager` and finally decoded into text.
+### GptModel Core Logic (shared by both modes)
+- `DataManager` tokenizes and applies **left padding**, tracking `seq_len` and `pad_len`.
+- `GptModel::forward` (or continuous sampling APIs) uses **prefill -> decode** staging with per-layer KV caches.
+- Prefill runs full prompt forward once; decode feeds one token per step with KV cache append/reuse.
+- EOS filtering and active-sample bookkeeping keep sample IDs, generated tokens, and position lengths aligned.
 
 ---
 
-## Key Features (learning-oriented)
+## Key Features
 
-- **Complete inference pipeline**: from config loading, weight parsing, tokenizer, prefill/decode, to sampling and output.
-- **Clear GPT component decomposition**: Embedding → Transformer Blocks (Self-Attn + MLP) × N → Norm → output projection, easy to map to papers and common implementations.
-- **Configurable sampling**: built-in Greedy / Top-K / Top-P sampling, controlled via CLI flags.
-- **KV cache and staged inference**: separate Prefill/Decode with cache reuse during Decode, reflecting real inference frameworks.
-- **Minimal dependencies, pure C++ core**: aside from logging and JSON parsing, the core logic is implemented in C++.
+- End-to-end inference path from config/weights/tokenizer to sampled output
+- Clear GPT decomposition: Embedding -> Blocks(Self-Attn + MLP) x N -> Norm -> output projection
+- Greedy / Top-K / Top-P sampling with explicit CLI controls
+- Continuous batching service mode for multi-request decode scheduling
+- Regression/invariant test gates for critical generation/cache/data-manager behaviors
+- CPU-first baseline with optional CUDA acceleration path
 
 ---
 
 ## Configuration & Extension Points
 
-- **Model/tokenizer paths**: in `include/config.hpp`, defaulting to files under `data/model/`.
-- **Precision**: default build uses BF16 (`USE_BF16`). Switch to FP16/FP32 by adjusting compile-time macro definitions.
-- **OpenMP**: enabled by default (`EASY_LLM_ENABLE_OPENMP=ON`); you can disable it via CMake options or install an OpenMP runtime.
-- **Model adaptation**: currently adapted to Qwen2.5-0.5B (weight key naming and config). To switch models, ensure `config.json`, weight keys, and tokenizer assets are compatible.
+- **Model/tokenizer paths**: `include/config.hpp` (defaults under `data/model/`)
+- **Precision macro**: default `USE_BF16`; can be adjusted at compile time
+- **OpenMP**: controlled by `EASY_LLM_ENABLE_OPENMP`
+- **Model adaptation**: `create_layer_key_prefix` dispatches by `architecture/model_type` (currently Qwen2 family)
+- **Model param validation**: pre-load key/shape checks reduce silent mismatch risk
 
 ---
 
 ## Tests & Reproducibility
 
-- Test data lives under `test/`.
+Build and run regression gates:
+
+```bash
+cmake --build build --target easy_llm_regression_gates -j8
+ctest --test-dir build --output-on-failure -L "^invariant_gate$"
+```
+
+CUDA-specific invariant tests (when CUDA build is enabled):
+
+```bash
+ctest --test-dir build --output-on-failure -L "^invariant_gate_cuda$"
+```
+
+Helper script:
+
+```bash
+bash scripts/run_regression_gates.sh
+bash scripts/run_regression_gates.sh --with-cuda
+```
 
 ---
 
 ## FAQ
 
 **Q: Where is the output saved when using `-f/--prompt-file`?**  
-A: An output file named `*_output*` is created in the same directory as the input file, preserving the extension (e.g., `test_batch.txt` → `test_batch_output.txt`).
+A: Output is written to a sibling file named `*_output*` with the same extension (for example, `test_batch.txt` -> `test_batch_output.txt`).
 
 **Q: Why isn't this heavily optimized?**  
-A: This project is a teaching/learning implementation focused on readability and a clear structure.
+A: It is a learning-oriented implementation prioritizing readable inference logic and debuggability.
 
 ---
 
 ## Dependencies
 
 - `spdlog`: logging (vendored in `include/third_party/spdlog` and `src/third_party/spdlog`)
-- `nlohmann/json`: JSON parsing (vendored as `include/third_party/json.hpp`)
+- `nlohmann/json`: JSON parsing (vendored in `include/third_party/json.hpp`)
 
 Everything else is implemented in C++.
