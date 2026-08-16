@@ -82,7 +82,7 @@ cmake --build build --target easy_llm_regression_gates
 从 HuggingFace 下载：
 
 ```bash
-cd <repo_root>
+# 在仓库根目录
 mkdir -p data/model && cd data/model
 BASE="https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main"
 curl -sSL -o config.json           "$BASE/config.json"
