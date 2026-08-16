@@ -22,6 +22,8 @@
 | [04：Serving、CUDA、测试与兼容性](easy_llm_guide/04-serving-cuda-tests.md) | 第 57～85 节：Continuous Batching、CUDA、安全 fallback、测试、常见坑 | 第三遍 |
 | [05：调试、扩展与参考资料](easy_llm_guide/05-debugging-extension-reference.md) | 第 86 节以后：调试方法、扩展点、总图、术语表、练习、外部资料 | 按需查阅 |
 
+另外，仓库已经有一份经过实测的 CPU-only 指南：[`build-test-run.zh-CN.md`](build-test-run.zh-CN.md)。如果目标是“先把项目编译、测试、跑起来”，可以先看它；本教程则更侧重“为什么这样实现”。
+
 ### 三遍阅读法
 
 **第一遍：只建立主线。**
@@ -153,8 +155,11 @@ KV heads    = 2
 
 ## 推荐第一次动手
 
+如果是无 GPU / 无 CUDA 环境，建议显式关闭 CUDA：
+
 ```bash
 cmake -S . -B build \
+  -DEASY_LLM_ENABLE_CUDA=OFF \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_CXX_COMPILER=g++
 
@@ -162,6 +167,8 @@ cmake --build build --target easy_llm -j8
 
 ./build/easy_llm --greedy "Hello"
 ```
+
+这里有一个容易踩的坑：`CMakeLists.txt` 里的 `EASY_LLM_ENABLE_CUDA` 默认值确实是 `OFF`，但仓库当前的 `build.sh` **显式传入了 `-DEASY_LLM_ENABLE_CUDA=ON`**，并固定了 `CMAKE_CUDA_ARCHITECTURES=120`。因此没有 CUDA 工具链/GPU 时，不要直接把 `build.sh` 当作 CPU 构建脚本。完整、已实测的构建/测试步骤见 [`build-test-run.zh-CN.md`](build-test-run.zh-CN.md)。
 
 然后打开：
 
