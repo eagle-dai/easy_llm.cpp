@@ -145,15 +145,23 @@ Active Requests
 - OpenMP 可选，默认尝试开启
 - 模型文件放在 `data/model/`
 
-推荐构建：
+推荐构建时把 CPU-only 意图写清楚，显式关闭 CUDA：
 
 ```bash
 cmake -S . -B build \
+  -DEASY_LLM_ENABLE_CUDA=OFF \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_CXX_COMPILER=g++
 
 cmake --build build --target easy_llm -j8
 ```
+
+这里有一个很容易踩的坑：
+
+- `CMakeLists.txt` 里的 `EASY_LLM_ENABLE_CUDA` 默认值是 `OFF`；
+- 但仓库当前的 `build.sh` **显式传入 `-DEASY_LLM_ENABLE_CUDA=ON`**，并固定 `CMAKE_CUDA_ARCHITECTURES=120`。
+
+因此在没有 CUDA 工具链/GPU 的机器上，不要直接把 `build.sh` 当 CPU 构建脚本。仓库中已经有经过实测的 CPU-only 编译/测试/运行指南：[`../build-test-run.zh-CN.md`](../build-test-run.zh-CN.md)。
 
 为什么建议先用 CPU？
 
@@ -207,6 +215,8 @@ Qwen/Qwen2.5-0.5B-Instruct
   --top-k 40 \
   "Hello"
 ```
+
+这里先提前说明一个容易误读的点：**当前 `--max-steps` 不是常见 API 里的纯 `max_new_tokens`**。它更接近把 prompt 位置也计入的总 step ceiling；Prefill 本身已经会生成第一个 token。第 50 节会结合 `gpt_model.cpp` 和 `continuous_batch_server.cpp` 的实际代码展开这个语义。
 
 先看帮助：
 
