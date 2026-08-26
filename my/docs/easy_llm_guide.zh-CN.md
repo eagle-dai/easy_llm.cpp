@@ -1,66 +1,80 @@
-# easy_llm.cpp 教学式源码教程：从一条 Prompt 到 Continuous Batching
+# easy_llm.cpp 教学式源码教程：看见一条 Prompt 如何变成下一个 Token
 
 > **生成与核验要求（精简版）**
 >
-> 本文按“读者需要依次理解什么”而不是按 repo 目录组织：先建立项目心智模型和真实 Golden Path，再逐步深入关键源码、状态所有权、Prefill/Decode、Attention/KV Cache、Continuous Batching、CPU/CUDA 边界、错误处理和测试。事实优先级为 executable code → configuration → tests → repository documentation；发生冲突时明确指出 documentation drift。代码片段只保留理解当前问题所需的最小部分。Mermaid 图必须与代码一致，并在图后说明“这张图最需要记住什么”。
+> 本文按“读者需要依次理解什么”而不是按仓库目录组织：先建立项目心智模型和真实 Golden Path，再沿同一条请求观察每一步输入/输出，之后才深入 Tokenizer、Transformer、Attention、KV Cache、Sampling、Continuous Batching、CPU/CUDA、可靠性与扩展边界。背景知识按 Just-in-time 原则出现；代码片段只保留当前理解所需的最小部分。事实优先级为 executable code → configuration → tests → repository documentation；发生冲突时明确指出 documentation drift。Mermaid 图必须与当前代码一致，并在图后说明“这张图最需要记住什么”。
 >
 > **核验日期：2026-08-26**  
-> **核验代码快照：`release@5e715177299440848ea7a63077e4da7315cba0aa`**
+> **核验代码快照：`release@8cdf0c51363f5a39bbadc9de996c1504761aad52`**
+>
+> 本文还有一个明确目标：**借这个项目理解 LLM inference（大语言模型推理）到底在做什么。** 因此会反复追问每一步的输入是什么、输出是什么、shape 怎么变化、状态保存在哪里，以及下一步为什么需要这些数据。
 
 ---
 
 # 第一部分：先把整个系统看懂
 
-## 0. 这个项目到底解决什么问题
+## 0. 这个项目真正适合拿来学什么
 
-`easy_llm.cpp` 是一个用于**学习和验证 LLM inference（大语言模型推理）完整链路**的微型 C++ 框架。
+`easy_llm.cpp` 是一个用于学习和验证 LLM inference 完整链路的微型 C++ 实现。仓库默认示例面向 **Qwen2 family**，README 推荐 **Qwen2.5-0.5B-Instruct**。
 
-它当前面向 **Qwen2 family**，仓库默认示例是 **Qwen2.5-0.5B-Instruct**。它没有把关键步骤隐藏在 PyTorch、Transformers 或大型 serving framework 里，而是直接实现：
+它最有学习价值的地方不是“能回答问题”，而是把大型框架通常隐藏起来的关键步骤直接摊开：
 
 ```text
-Prompt
+用户文本
 → Chat Template
 → Tokenizer / BPE
-→ Token IDs + Padding
+→ Token IDs
+→ Left Padding
 → Embedding
 → Transformer Blocks
 → Logits
-→ Softmax + Sampling
+→ Softmax
+→ Sampling
 → Next Token
 → Decode loop
 ```
 
-它还实现了第二条更接近 serving 的路径：**Continuous Batching（连续批处理）**。请求可以持续进入，调度器在每一轮把当前 active requests 重新组成 batch，并复用各自已有的 KV cache。
+另外还有一条更接近推理服务的路径：
+
+```text
+多个请求不断到达
+→ admission
+→ Prefill
+→ 每轮重新组成 active batch
+→ Decode
+→ 每个请求复用自己的 KV Cache
+→ 完成后回收 slot
+```
 
 先把边界说清楚：
 
 - 它不是 `llama.cpp`、vLLM、TensorRT-LLM 的替代品；
-- 设计重点是**可读性、正确性和可验证性**，而不是极致吞吐；
-- `--serve` 当前是 **stdin/stdout 长驻进程**，不是 HTTP server；
-- 当前没有网络 API、authentication（认证）、authorization（授权）、持久化、retry、idempotency key 或 token streaming；
-- CPU 是最清楚的 correctness baseline，CUDA 是可选 backend。
+- 当前重点是**可读、可验证、可修改**，不是极致吞吐；
+- `--serve` 是 stdin/stdout 长驻进程，不是 HTTP server；
+- 没有数据库、durable queue、网络认证、retry、idempotency key 或外部 token streaming API；
+- CPU 路径是最容易追踪的 correctness baseline，CUDA 是可选 operator backend。
 
-因此读这个项目最重要的问题是：
+如果只记一句话：
 
-> **一条 Prompt 在一个足够小、能够顺着源码读完的 C++ 系统里，怎样一步步变成新 token；多个请求同时存在时，这些状态又归谁管理？**
+> **这个项目把“文本如何逐 token 经过一个 Decoder-only Transformer，并借助 KV Cache 持续生成”缩小到一套可以顺着源码读完的 C++ 代码。**
 
 ---
 
 ## 1. 先只记住 7 个角色
 
-第一次进入仓库，不要先按目录扫几十个文件。先记住下面这些角色：
+第一次进入仓库，不要从文件树开始背。先建立下面的心智模型。
 
-| 模块 | 做什么 | 为什么单独存在 | 主要输入/输出 | 主要状态在哪里 | 最先看哪里 |
+| 角色 | 做什么 | 为什么单独存在 | 最主要输入 → 输出 | 主要状态 | 第一处源码 |
 |---|---|---|---|---|---|
-| `main` | 创建对象、加载配置、选择运行模式 | 避免 CLI/组装逻辑进入模型算法 | CLI/stdin → 已组装的运行流程 | `CliOptions`、`Config` | `src/main.cpp` |
-| `GptEngine` | 串起一次性 batch 推理 | 让 orchestration 与模型计算分开 | prompts → 调用 DataManager/GptModel | 几乎不拥有业务状态 | `src/gpt_engine.cpp` |
-| `DataManager` | Tokenize、left padding、记录单次模式输出 | 输入整理和输出生命周期不属于 Transformer | text ↔ batched IDs / generated IDs | `inputs_`、`outputs_`、`seq_len`、`pad_len` | `src/data_manager.cpp` |
-| `Tokenizer` / `Bpe` | 文本 ↔ token/token ID | 文本协议与模型数学分离 | UTF-8 text ↔ IDs | vocab、merges、special tokens | `src/tokenizer.cpp`, `src/bpe.cpp` |
-| `GptModel` | Prefill/Decode orchestration + model graph | 将生成状态机和具体层组合起来 | token batch → sampled tokens | `GenerationContext`、Sampler RNG | `src/models/gpt_model.cpp` |
-| `Block` / `SelfAttn` / `MLP` | Transformer 数学计算 | Attention、MLP、cache 各自有独立职责 | hidden states → hidden states | 每层 `SelfAttn` 拥有 KV cache | `src/models/block.cpp`, `self_attn.cpp` |
-| `ContinuousBatchServer` | 管 pending/active request、slot 和 decode rounds | 动态请求生命周期不适合塞进 `GptModel` | stdin requests → completed text | pending queue、active requests、free slots | `src/continuous_batch_server.cpp` |
+| `main` | 解析 CLI、加载对象、选择运行模式 | CLI/组装不应污染模型数学 | CLI/stdin → 已组装流程 | `CliOptions`, `Config` | `src/main.cpp` |
+| `GptEngine` | 编排一次性 batch 推理 | orchestration 与模型计算分离 | prompts → `GptModel::forward()` | 几乎不保存生成状态 | `src/gpt_engine.cpp` |
+| `DataManager` | tokenize、left padding、保存单次模式输出 | 输入整理不属于 Transformer | text ↔ batched IDs / generated IDs | `inputs_`, `outputs_`, `seq_len`, `pad_len` | `src/data_manager.cpp` |
+| `Tokenizer` / `Bpe` | 文本 ↔ token ↔ ID | 文本协议与模型数学分离 | UTF-8 text ↔ IDs | vocab、merges、special tokens | `src/tokenizer.cpp`, `src/bpe.cpp` |
+| `GptModel` | Prefill/Decode 编排 + 模型图 | 生成状态机与具体层组合在这里 | token batch → sampled token IDs | `GenerationContext`, RNG/Sampler | `src/models/gpt_model.cpp` |
+| `Block` / `SelfAttn` / `MLP` | Transformer 数学 | Attention、MLP、cache 生命周期彼此独立 | hidden states → hidden states | 每层 `SelfAttn` 的 KV Cache | `src/models/*.cpp` |
+| `ContinuousBatchServer` | 管 pending/active request、slot、round | 动态请求生命周期不应塞进模型内部 | stdin requests → completed text | queues、active requests、free slots | `src/continuous_batch_server.cpp` |
 
-后面所有深入内容，都可以回到这张表判断：“这件事到底应该由谁负责？”
+后面遇到任何变量，先问：**它属于请求生命周期、模型当前计算，还是历史 Attention 状态？** 很多设计就会自然变清楚。
 
 ---
 
@@ -85,7 +99,7 @@ flowchart TB
     E --> D
     D --> T
     E --> G
-    G -. records single-mode tokens .-> D
+    G -. record token .-> D
     S --> T
     S --> G
     G --> B
@@ -95,14 +109,7 @@ flowchart TB
 
 **这张图最需要记住什么：**
 
-单次模式的直接 orchestration 是 `GptEngine → DataManager / GptModel`，不是 `DataManager → GptModel`。`GptModel` 只持有 `DataManager&`，在生成过程中把 token 记录回去。
-
-另外，系统没有一个“万能状态中心”：
-
-- 单次输入/输出状态主要在 `DataManager`；
-- 服务请求生命周期状态主要在 `ContinuousBatchServer`；
-- 历史 Attention 状态在每一层 `SelfAttn` 的 KV cache；
-- Prefill/Decode 当前轮的状态在 `GenerationContext`。
+系统没有一个“万能状态中心”。单次输入/输出主要在 `DataManager`，服务请求生命周期在 `ContinuousBatchServer`，每层历史 K/V 在 `SelfAttn`，某次 `forward()` 的生成状态在 `GenerationContext`。
 
 ---
 
@@ -119,78 +126,348 @@ sequenceDiagram
     participant G as GptModel
     participant X as Blocks + Sampler
 
-    U->>M: easy_llm --greedy "Hello"
-    M->>M: parse args + apply chat template
+    U->>M: --greedy "Hello"
+    M->>M: apply_chat_template()
     M->>E: run(prompts)
-    E->>D: add_input + get_inputs
-    D->>D: tokenize + left padding
+    E->>D: add_input() + get_inputs()
+    D->>D: tokenize + left pad
     E->>G: forward(batch)
     G->>X: Prefill whole prompt
     X-->>G: first generated token
-    loop until EOS / max_steps
-        G->>X: Decode one token
-        X-->>G: next token
+    G->>D: add_output_token()
+    loop Decode until EOS / limit
+        G->>X: Decode one new token
+        X-->>G: next generated token
+        G->>D: add_output_token()
     end
-    G->>D: add_output_token(...)
     E->>D: log_outputs()
-    D-->>U: decoded/logged text
+    D-->>U: decoded text
 ```
 
 **这张图最需要记住什么：**
 
-一条请求不是“Tokenizer → model → string”三步而已：
-
-1. `main` 先把原始 Prompt 套成 Qwen chat template；
-2. `DataManager` 把文本转换成规则 batch；
-3. `GptModel` 先 Prefill，再反复 Decode；
-4. `SelfAttn` 在每层不断积累 KV cache；
-5. `Sampler` 每轮选出 next token；
-6. 当前单次模式真正保存生成结果的是 `DataManager`，最终再 decode 成文本。
-
-### 3.1 对应的真实源码
-
-`src/main.cpp` 最后创建：
-
-```cpp
-easy_llm::GptEngine gpt_engine{
-    move(gpt_model), move(config), move(data_manager)
-};
-gpt_engine.run(prompts, output_path);
-```
-
-`src/gpt_engine.cpp` 的主线几乎只有：
-
-```cpp
-for (const string& prompt : prompts) {
-    data_manager_->add_input(InputSample{prompt});
-}
-auto batch = data_manager_->get_inputs();
-model_->forward(batch);
-data_manager_->log_outputs(output_path);
-```
-
-这正是 `GptEngine` 独立存在的原因：**它只负责 orchestration（编排），不负责 Tokenizer 算法，也不负责 Transformer 数学。**
+单次模式的真实 orchestration 是 `main → GptEngine → DataManager / GptModel`。模型不是一次直接输出一句字符串：Prefill 产生第一枚新 token，之后 Decode 每轮再产生一枚；`GptModel` 在生成过程中把 token 记录进 `DataManager`，最后才统一 decode 成文本。
 
 ---
 
-## 4. 读到这里，应该已经能回答四个问题
+## 4. 一条 Prompt 的“显微镜视图”：每一步输入输出到底长什么样
 
-1. 项目做什么：用相对直接的 C++ 展开 LLM inference 的完整关键链路；
-2. 单次主链：`main → GptEngine → DataManager / GptModel → Blocks/Sampler`；
-3. Prefill 处理完整 Prompt，Decode 后续通常每轮只喂一个新 token；
-4. request state、generation state、KV state 分属不同 owner。
+这一节先不钻公式。目标是建立一个可观察的端到端画面。
 
-如果这四点清楚，再继续进入 Tokenizer、Attention 和 CUDA，就不会把不同层次的概念混在一起。
+### 4.1 Step 0：用户输入不是模型真正看到的输入
+
+用户输入：
+
+```text
+Hello
+```
+
+`src/cli_options.cpp::apply_chat_template()` 会把它变成：
+
+```text
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+Hello<|im_end|>
+<|im_start|>assistant
+```
+
+所以第一层输入输出是：
+
+```text
+输入: "Hello"
+输出: 一段带 system/user/assistant 控制 token 的完整 Prompt
+```
+
+这一步还没有任何神经网络计算。
+
+### 4.2 Step 1：Tokenizer 把字符串变成离散 ID
+
+概念上：
+
+```text
+完整 Prompt
+→ token strings
+→ token IDs
+```
+
+例如 special token 在官方 Qwen2.5 tokenizer 中有明确 ID：
+
+```text
+<|im_start|> → 151644
+<|im_end|>   → 151645
+<|endoftext|>→ 151643
+```
+
+普通文本具体会切成哪些 token，取决于 `tokenizer.json` 的 vocab/merges。模型文件没有提交到本 repo，因此本文**不伪造 `Hello` 的实际 token ID**。
+
+可以先用一个缩小后的示意理解数据形状：
+
+```text
+tokens:
+["<|im_start|>", "system", ..., "Hello", "<|im_end|>", ...]
+
+IDs:
+[151644, id(system), ..., id(Hello), 151645, ...]
+```
+
+`Tokenizer::tokens_to_ids()` 当前还有一个非常重要的实现行为：只要模型 `config.json` 中 `bos_token_id >= 0`，它就会额外在最前面插入该 ID。
+
+对于官方 Qwen2.5-0.5B-Instruct：
+
+```text
+config.json:          bos_token_id = 151643
+tokenizer_config.json:add_bos_token = false
+```
+
+而当前项目并不读取 `add_bos_token` 语义，因此可能得到：
+
+```text
+[151643, 151644, ...]
+```
+
+这就是一个很具体的“能读取 Hugging Face 文件 ≠ 完整复刻 Hugging Face runtime”的例子。
+
+### 4.3 Step 2：两个不同长度请求怎样变成一个矩阵
+
+假设 tokenize 后有两条请求。下面 ID **仅为教学示意**：
+
+```text
+A: [11, 12]
+B: [21, 22, 23, 24]
+```
+
+`DataManager` 使用 left padding：
+
+```text
+A: [PAD, PAD, 11, 12]
+B: [ 21,  22, 23, 24]
+```
+
+同时保存：
+
+| sample | 原始 seq_len | pad_len | 模型看到的 row width |
+|---|---:|---:|---:|
+| A | 2 | 2 | 4 |
+| B | 4 | 0 | 4 |
+
+因此送进 `GptModel::forward()` 的 C++ 类型是：
+
+```cpp
+std::vector<std::vector<int>>
+```
+
+形状可以理解为：
+
+```text
+[B, S] = [2, 4]
+```
+
+这里的 `B` 是 batch size，`S` 是 padding 后统一 sequence width。
+
+### 4.4 Step 3：Embedding 把“整数”变成“向量”
+
+官方 Qwen2.5-0.5B-Instruct 的 `hidden_size = 896`。
+
+所以一个 token ID 不再是一个整数，而是从 embedding weight 中查出一行 896 维向量：
+
+```text
+Token IDs: [2, 4]
+       ↓ Embedding lookup
+Tensor:    [2, 4, 896]
+```
+
+为了能画出来，把 896 维缩成 3 维做示意：
+
+```text
+ID 11 → [ 0.12, -0.07,  0.31, ...]
+ID 12 → [-0.22,  0.18,  0.04, ...]
+```
+
+这些数字只是视觉示意，不是 Qwen 实际权重。
+
+最需要理解的是：
+
+> **从这一刻开始，模型不再处理字符串，也几乎不再处理 token 的“文字含义”；它处理的是多维 Tensor。**
+
+### 4.5 Step 4：Tensor 穿过 24 个 Transformer Block
+
+官方 Qwen2.5-0.5B-Instruct 有 24 层。shape 的主干保持：
+
+```text
+[B, S, 896]
+→ Block 0
+→ [B, S, 896]
+→ Block 1
+→ [B, S, 896]
+→ ...
+→ Block 23
+→ [B, S, 896]
+```
+
+每个 Block 内部会做：
+
+```text
+RMSNorm
+→ Self-Attention
+→ Residual Add
+→ RMSNorm
+→ Gated MLP
+→ Residual Add
+```
+
+“shape 没变”不等于“数据没变”。每一层都在重新计算每个位置的 hidden representation。
+
+### 4.6 Step 5：最后把 hidden vector 映射回整个 vocabulary
+
+最终 RMSNorm 后，项目复用 embedding weight 做 vocabulary projection：
+
+```text
+[B, S, 896]
+→ tied embedding projection
+→ logits [B, S, V]
+```
+
+官方 Qwen2.5-0.5B-Instruct：
+
+```text
+V = vocab_size = 151936
+```
+
+如果当前只有 1 条请求、Prompt padding 后长度为 42：
+
+```text
+logits shape = [1, 42, 151936]
+```
+
+含义是：**42 个位置，每个位置都对 151936 个 vocabulary token 给出一个分数。**
+
+生成 next token 时，Prefill 只取最后一个位置：
+
+```text
+[1, 42, 151936]
+        ↓ 只取 S-1
+[1, 1, 151936]
+```
+
+### 4.7 Step 6：Logits → Probability → 一个 token ID
+
+`GptModel` 对 logits 调 `ops::softmax()`：
+
+```text
+logits [1,1,V]
+→ probabilities [1,1,V]
+→ Sampler
+→ next_token_id
+```
+
+如果是 `--greedy`：
+
+```text
+直接选择 probability 最大的 ID
+```
+
+如果是普通 sampling，则还会经过 temperature、Top-K、Top-P，后文单独深入。
+
+### 4.8 Step 7：Prefill 结束时，除了“生成一个 token”，还留下了 KV Cache
+
+这是理解 LLM 生成最关键的一步。
+
+Prefill 输入完整 Prompt：
+
+```text
+[t0, t1, t2, ..., t41]
+```
+
+输出第一枚新 token：
+
+```text
+t42
+```
+
+同时**每个 Transformer layer 的 Self-Attention 都保存了 Prompt 历史的 K/V**：
+
+```text
+Layer 0: K/V for t0...t41
+Layer 1: K/V for t0...t41
+...
+Layer 23: K/V for t0...t41
+```
+
+### 4.9 Step 8：Decode 不再重新输入整个 Prompt
+
+下一轮只输入：
+
+```text
+[t42]
+```
+
+模型计算这一枚 token 的新 Q/K/V，把 K/V append 到历史 cache：
+
+```text
+before: cache = t0...t41
+input:          t42
+append: cache = t0...t42
+```
+
+再得到：
+
+```text
+t43
+```
+
+之后重复：
+
+```text
+round 0 Prefill: input t0...t41 → sample t42 → cache len 42
+round 1 Decode : input t42     → sample t43 → cache len 43
+round 2 Decode : input t43     → sample t44 → cache len 44
+...
+```
+
+```mermaid
+flowchart LR
+    P[Prompt IDs t0..t41]
+    F[Prefill]
+    C1[KV: t0..t41]
+    T42[Sample t42]
+    D1[Decode t42]
+    C2[KV: t0..t42]
+    T43[Sample t43]
+
+    P --> F
+    F --> C1
+    F --> T42
+    T42 --> D1
+    C1 --> D1
+    D1 --> C2
+    D1 --> T43
+```
+
+**这张图最需要记住什么：**
+
+`Prefill` 和 `Decode` 使用的是同一个 Transformer；不同的是输入长度和历史状态。Prefill 一次处理完整历史并建立 KV，Decode 每次只处理新 token，并复用历史 KV。
 
 ---
 
-# 第二部分：从文本进入模型
+## 5. 读到这里，应该能回答这 6 个问题
 
-## 5. `main.cpp`：为什么它只是 Composition Root
+1. 用户文本不会直接进入神经网络，先经过 chat template 和 tokenizer；
+2. 模型真正吃的是整数 ID，再经 embedding 变成 Tensor；
+3. Transformer 输出的是 vocabulary 上的 logits，不是字符串；
+4. Sampler 每轮只选择一枚 next token；
+5. Prefill 建立历史 KV Cache；Decode 只输入新 token 并追加 cache；
+6. 最终文本是 generated token IDs 累积完成后再 decode 得到的。
 
-`src/main.cpp` 可以理解成 **composition root（对象组装入口）**：负责创建对象、连接依赖、选择单次模式或 `--serve`，而不承担模型算法。
+如果这六点清楚，下面进入源码时就不会把“文本层、模型层、请求状态层”混在一起。
 
-启动过程大致是：
+---
+
+# 第二部分：文本怎样进入模型
+
+## 6. `main.cpp`：Composition Root，而不是模型算法
+
+`src/main.cpp` 的职责是把对象组装起来：
 
 ```text
 parse CLI
@@ -204,16 +481,19 @@ parse CLI
 → GptEngine 或 ContinuousBatchServer
 ```
 
-这种边界让：
+为什么不让 `GptModel` 自己加载 CLI、Tokenizer、文件？
 
-- CLI 改动不会进入 Attention；
-- 模型权重加载不会进入调度器；
-- Continuous Batching 可以复用同一个 `GptModel`；
-- CPU/CUDA backend 可以隐藏在模型组件和 ops 下面。
+因为这些属于不同变化原因：
 
-### 5.1 CLI 默认值会覆盖 `Config` 默认值
+- CLI 参数可能改，但 Attention 数学不应跟着改；
+- tokenizer 规则可能改，但 KV Cache ownership 不应跟着改；
+- serving transport 以后可能从 stdin 换 HTTP，但 Transformer 不应知道 HTTP。
 
-`Config` 内部的 sampling 初始值并不是最终 CLI 默认行为。`main.cpp` 会执行：
+这就是模块边界最实际的价值。
+
+### 6.1 CLI 默认 sampling 参数真正来自哪里
+
+`Config` 有自己的初始值，但 `main.cpp` 随后用 `CliOptions` 覆盖：
 
 ```cpp
 config->temperature = options.temperature;
@@ -222,7 +502,7 @@ config->top_k = options.top_k;
 config->seed = options.seed;
 ```
 
-而 `CliOptions` 默认是：
+CLI 默认值在 `include/cli_options.hpp` / `src/cli_options.cpp`：
 
 ```text
 temperature = 0.8
@@ -231,78 +511,72 @@ top_k      = 20
 seed       = 42
 ```
 
-所以判断实际启动参数时，要看 `include/cli_options.hpp`，不能只看 `include/config.hpp`。
+所以判断“实际启动参数”，不能只看 `Config` struct 的默认值。
+
+### 6.2 `GptEngine::run()`：Golden Path 在源码里其实很短
+
+`src/gpt_engine.cpp` 的核心调用链：
+
+```cpp
+for (const string& prompt : prompts) {
+    data_manager_->add_input(InputSample{prompt});
+}
+auto batch = data_manager_->get_inputs();
+model_->forward(batch);
+data_manager_->log_outputs(output_path);
+```
+
+调用关系很清楚：
+
+```text
+GptEngine
+├─ 调 DataManager：准备输入 batch
+├─ 调 GptModel：执行完整生成
+└─ 调 DataManager：decode / 输出结果
+```
+
+这也是 `GptEngine` 值得单独存在的原因：它负责 orchestration（编排），但不把 Tokenizer 算法、Transformer 数学或 KV Cache 实现混进来。
 
 ---
 
-## 6. Chat Template：模型真正看到的不是 `Hello`
+## 7. Chat Template：为什么它属于输入协议，而不属于模型数学
 
-`src/cli_options.cpp` 的 `apply_chat_template()` 当前硬编码：
+当前 `apply_chat_template()` 是硬编码模板，不动态执行 `tokenizer_config.json` 里的 Jinja chat template。
+
+这意味着：
 
 ```text
-<|im_start|>system
-You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
-<|im_start|>user
-Hello<|im_end|>
-<|im_start|>assistant
+换 model.safetensors
+≠
+自动支持另一个 Chat Model
 ```
 
-因此输入 `Hello` 后，Tokenizer 处理的是完整模板文本。
+因为一个 Chat Model 的输入协议至少还包括：
 
-这会直接影响：
+```text
+system/user/assistant 格式
+special tokens
+BOS/EOS/PAD 规则
+```
 
-- Prompt token 数；
-- `max_steps` 剩余的生成空间；
-- special token；
-- 换模型时的兼容性。
-
-### 当前实现边界
-
-虽然模型目录里有 `tokenizer_config.json`，当前 C++ **没有动态执行其中的 chat template**。Chat template 写死在 `apply_chat_template()`。
-
-所以“换一份 safetensors”不等于“自动支持另一种 chat model”。
+官方 Qwen2.5 tokenizer config 中的简单 system/user/assistant 格式与当前硬编码模板接近，但官方 template 还包含 tools 等分支；当前项目没有实现这些完整语义。
 
 ---
 
-## 7. Tokenizer / BPE：文本怎样变成整数
+## 8. Tokenizer / BPE：这里不是“把一个词变一个 ID”
 
-最低限度先记：
-
-```text
-文本
-→ token strings
-→ token IDs
-```
-
-反方向：
+`Tokenizer` 的主职责：
 
 ```text
-token IDs
-→ token strings
-→ 文本
+Tokenizer
+├─ special token scanning
+├─ token ↔ ID mapping
+├─ BOS/PAD rules
+└─ BPE
+   └─ ordinary text → byte mapping → merges
 ```
 
-`Tokenizer` 初始化读取：
-
-| 文件 | 当前代码实际使用的内容 |
-|---|---|
-| `tokenizer.json` | `model.vocab`、`model.merges` |
-| `tokenizer_config.json` | `added_tokens_decoder`、special tokens、pad token |
-
-### 7.1 BPE 是什么
-
-BPE（Byte Pair Encoding，字节对合并编码）在 `src/bpe.cpp` 中负责普通文本片段：
-
-```text
-UTF-8 text
-→ byte-level mapping
-→ 根据 merge rank 反复合并
-→ token strings
-```
-
-`bpe_cache_` 会缓存已经处理过的片段，避免重复 merge。
-
-### 7.2 为什么 special token 必须绕过普通 BPE
+### 8.1 Special Token 为什么先单独识别
 
 例如：
 
@@ -310,107 +584,97 @@ UTF-8 text
 <|im_start|>
 ```
 
-这是模型定义的一个整体控制 token，不能先被普通 BPE 拆碎。
+必须作为一个整体控制 token，不能先被普通 BPE 拆掉。
 
-`EncodingSession` 会先识别 special tokens，普通区段交给 `Bpe`，special token 本身直接保留。
+`EncodingSession` 会寻找最近的 special token，普通区间交给 `Bpe::encode_into()`，special token 直接放进 token list。
 
-所以职责是：
+### 8.2 当前 BPE 做了什么
+
+`src/bpe.cpp`：
 
 ```text
-Tokenizer
-├─ vocab / ID mapping
-├─ BOS / PAD / special-token rules
-└─ Bpe
-   └─ ordinary text encoding
+plain text segment
+→ std::istringstream 按 whitespace 取 word
+→ byte encoder
+→ 找 merge rank 最小的相邻 pair
+→ 反复 merge
+→ token strings
 ```
+
+`bpe_cache_` 会缓存已经处理过的 word。
+
+### 8.3 一个必须记住的兼容性边界
+
+Hugging Face Qwen2 tokenizer 的完整 pre-tokenization 行为比这里复杂。当前实现使用 `std::istringstream` 的 whitespace 逻辑，因此不能声称与 Transformers 对任意中文、标点、连续空格、换行、emoji 都逐 token parity。
+
+如果要比较模型 logits，正确排查顺序应该先是：
+
+```text
+exact input text
+→ exact token strings
+→ exact token IDs
+→ 再比较 logits
+```
+
+否则输入都不同，后面数学完全一致也不会输出一致结果。
 
 ---
 
-## 8. Tokenizer 兼容性：能读 HF 文件 ≠ 完整 HF runtime
+## 9. `DataManager`：Left Padding 为什么会一路影响到 Attention
 
-这是项目里很值得提前知道的兼容性边界。
-
-当前 `Bpe::encode_into()` 的普通文本切分比 Hugging Face Qwen2 tokenizer 的完整 pre-tokenization pipeline 简单，主要基于 whitespace 片段后再做 byte-level BPE。
-
-因此它不应该被描述成：
-
-> “完整逐 token 复刻任意 Hugging Face tokenizer”。
-
-如果目标是学习 inference chain，这种实现更容易阅读；如果目标是和 Transformers 做严格 logits parity，应先建立 tokenizer parity corpus，覆盖：
+`DataManager::get_inputs()`：
 
 ```text
-英文
-中文
-连续空格
-换行
-标点
-emoji
-数字
-contractions
-special-token 边界
+tokenize_inputs()
+→ compute_batch_padding()
+→ apply_padding()
 ```
 
-并逐 case 比较 token IDs。
-
-### 8.1 BOS 也是独立兼容性规则
-
-`Tokenizer::tokens_to_ids()` 当前只要 `bos_token_id_ >= 0`，就会在 token IDs 前插 BOS。
-
-这个 ID 来自模型 `config.json`，而不是完整复刻 tokenizer runtime 中所有 `add_bos_token` 配置语义。
-
-所以做严格 parity 时，**第一枚 token 是否额外出现 BOS** 必须单独确认。
-
----
-
-## 9. `DataManager`：为什么 left padding 不只是“补齐长度”
-
-假设：
-
-```text
-A: [11, 12]
-B: [21, 22, 23, 24]
-```
-
-为了形成规则 batch，当前代码使用 left padding：
-
-```text
-A: [PAD, PAD, 11, 12]
-B: [ 21,  22, 23, 24]
-```
-
-同时每个 `InputSample` 保存：
+它保存：
 
 ```text
 seq_len = 真实 token 数
 pad_len = 左侧 PAD 数
 ```
 
-`test/data_manager_invariants_test.cpp` 就在保护这些值。
+这两个值后面会进入 generation position 和 Attention mask。
 
-为什么 `pad_len` 必须成为状态？因为后面：
+假设：
 
-- RoPE position 要抵消左侧 PAD；
-- Attention 不能看 PAD；
-- 不同 sample 的真实 sequence length 必须独立存在。
+```text
+A: PAD PAD 11 12
+B: 21  22  23 24
+```
 
-因此 `DataManager` 不只是“文件输入工具”，它是单次模式的**输入状态 owner**。
+A 的真实第一个 token `11` 位于数组 index 2，但语义 position 应该是 0。
+
+因此 Prefill 使用：
+
+```text
+position offset = -pad_len
+```
+
+A：
+
+```text
+array index : 0   1   2   3
+offset      : -2 -2  -2  -2
+RoPE pos    : -2 -1   0   1
+                         ↑
+                    real tokens start at 0
+```
+
+PAD 自己随后被 Attention mask 掉。
+
+这就是为什么 `pad_len` 不是一个“为了打印好看”的临时变量，而是后续正确性的状态。
 
 ---
 
-# 第三部分：模型怎样被构造出来
+# 第三部分：模型怎样从文件变成 C++ 对象
 
-## 10. `Config`：结构参数从哪里来
+## 10. `Config`：结构参数决定整个 Tensor 世界
 
-默认路径在 `include/config.hpp`：
-
-```text
-data/model/config.json
-data/model/model.safetensors
-data/model/tokenizer.json
-data/model/tokenizer_config.json
-```
-
-`Config::load_config()` 会读取：
+`src/config.cpp` 从 `data/model/config.json` 读取：
 
 ```text
 num_hidden_layers
@@ -419,89 +683,84 @@ num_key_value_heads
 hidden_size
 vocab_size
 max_position_embeddings
-bos_token_id / eos_token_id
+bos_token_id
+eos_token_id
 rope_theta
 architectures
 model_type
 ```
 
-这些值决定：
+以官方 Qwen2.5-0.5B-Instruct 为例：
 
-- 创建多少个 Block；
-- Query/KV head 数；
-- head dimension；
-- 权重应该具有的 shape。
+| 参数 | 值 | 对代码意味着什么 |
+|---|---:|---|
+| `num_hidden_layers` | 24 | 创建 24 个 `Block` |
+| `hidden_size` | 896 | hidden vector 宽度 896 |
+| `num_attention_heads` | 14 | Query heads = 14 |
+| `num_key_value_heads` | 2 | KV heads = 2，属于 GQA |
+| `head_dim` | 64 | `896 / 14` |
+| `vocab_size` | 151936 | 每个位置输出 151936 个 logits |
+| `rope_theta` | 1000000 | RoPE 参数 |
 
-### 一个错误处理细节
+当前 `Config` 并没有把 `intermediate_size`、`rms_norm_eps` 等所有字段都保存下来；有些维度从 checkpoint weight shape 得到，有些值目前写死在实现中。
 
-如果 `config.json` 打不开，当前 `load_config()` 记录 error 后 return，不会立刻 throw。随后模型参数校验通常会因为关键字段仍为 0 而失败。
+### 10.1 Config 读取失败的行为
 
-排障时不要只看最终 exception，要回看最前面的 config 日志。
+`Config::load_config()` 读不到 JSON 时：
+
+```text
+log error
+→ return
+```
+
+不会立即 throw。之后模型初始化通常会因为结构字段仍为 0 而失败。
+
+所以排障要看**最早的错误日志**，不要只看最后一次 exception。
 
 ---
 
-## 11. Safetensors Loader：`mmap` 不等于 zero-copy inference
+## 11. Safetensors Loader：`mmap` 只是加载方式，不是运行期零拷贝
 
-`src/models/loader.cpp` 直接解析 Safetensors：
+`src/models/loader.cpp` 的主流程可以理解为：
 
 ```text
-open
+open file
 → fstat
-→ mmap file
-→ 读 8-byte header length
-→ parse JSON header
-→ 校验 dtype / shape / data offsets
-→ copy/convert 到 Tensor
+→ mmap
+→ 读取 8-byte header length
+→ parse JSON metadata
+→ 校验 dtype / shape / offset
+→ copy/convert into Tensor
 → munmap
 ```
 
-源 dtype 支持：
+源权重支持读取 BF16/F16/F32；当前标准 CMake target 走 `USE_BF16`。
 
-```text
-BF16 / F16 / F32
-```
+关键点：
 
-当前标准 CMake 构建固定定义 `USE_BF16`，因此运行时 target `data_type` 默认是 BF16。
-
-### 为什么 `mmap` 不等于权重一直映射文件
-
-`load_tensor()` 最终把数据装进 owning `Tensor`；`MMapGuard` 在加载函数结束时 unmap。
-
-因此真实关系是：
-
-> `mmap` 只是 loader 的文件访问方式；模型运行时权重属于自己的 `Tensor`。
+> `mmap` 让 loader 方便访问文件，并不代表模型 forward 时还直接引用磁盘映射区。权重最终进入 owning `Tensor`。
 
 ---
 
-## 12. `ModelParam`：启动期的权重暂存区
+## 12. `ModelParam` 与 `LayerKeyPrefix`：为什么加载阶段也要有边界
 
-它的核心结构可以理解为：
+`ModelParam` 可以理解为启动阶段的：
 
 ```text
-weight name → Tensor
+weight key → Tensor
 ```
 
-组件加载使用：
+组件通过 `take_param(key)` 把 Tensor move 到自己手里，并从暂存 map 删除。
 
-```cpp
-Tensor ModelParam::take_param(const string& key)
+这样能做到：
+
+```text
+checkpoint file
+→ ModelParam temporary ownership
+→ Embedding / Linear / Norm final ownership
 ```
 
-`take_param()` 会 move Tensor，并从 map 删除 key。
-
-这样：
-
-1. 大权重不会额外复制；
-2. ownership 明确从暂存区转移到具体模型组件；
-3. 初始化结束后可以检查还有哪些权重没人消费。
-
-当前 `validate_no_remaining_model_params()` 对多余权重只 warning，不是 hard error。
-
----
-
-## 13. `LayerKeyPrefix`：真实存在，但仍很小的扩展边界
-
-Qwen 权重 key 类似：
+`LayerKeyPrefix` 则负责把逻辑组件名映射到 checkpoint key，例如：
 
 ```text
 model.layers.0.self_attn.q_proj.weight
@@ -509,158 +768,160 @@ model.layers.0.mlp.up_proj.weight
 model.norm.weight
 ```
 
-`LayerKeyPrefix` 把逻辑组件映射成具体 checkpoint key。
+当前 architecture dispatch 只明确支持 Qwen2 family。它是扩展缝隙，但不是“加一个字符串就支持所有模型”的 plugin system。
 
-当前 `create_layer_key_prefix()` 仅识别 Qwen2 family：
+支持新模型还必须确认：
 
 ```text
-architecture 包含 qwen2
-或 model_type == qwen2
+Attention math
+MLP
+Norm
+RoPE
+Tokenizer
+Chat Template
+BOS/EOS/PAD
 ```
-
-否则 throw。
-
-所以它确实是 extensibility seam（扩展缝隙），但**不是通用 plugin/provider system**。支持新模型还要核对 Attention、MLP、Tokenizer、RoPE、chat template 等真正的结构差异。
 
 ---
 
-## 14. 参数校验为什么必须早于真正运行
+## 13. 参数校验为什么应在真正推理前完成
 
-`validate_model_params_before_load()` 会检查：
+`validate_model_params_before_load()` 会在模型构造阶段检查 required keys 和 shape。
 
-- required keys；
-- embedding `[vocab_size, hidden_size]`；
-- Q/K/V/O projection shape；
-- RMSNorm shape；
-- MLP intermediate dimensions；
-- head 配置的一致性。
-
-例如 GQA（Grouped Query Attention，分组查询注意力）：
+例如 Qwen2.5-0.5B：
 
 ```text
-Q output width   = hidden_size
-K/V output width = num_key_value_heads × head_dim
+Q projection width = 14 × 64 = 896
+K projection width =  2 × 64 = 128
+V projection width =  2 × 64 = 128
 ```
 
-如果 config 和 checkpoint 不匹配，应在模型初始化阶段给出清楚错误，而不是让问题拖到某个 matmul 才爆出来。
+如果 checkpoint/config 不匹配，最好在加载阶段直接指出哪个 key/shape 不对，而不是让错误拖到某个 matmul 甚至 silently wrong 的输出。
 
 ---
 
-# 第四部分：GptModel——Prefill 与 Decode
+# 第四部分：`GptModel`——真正的生成状态机
 
-## 15. `GptModel` 同时有两层职责
+## 14. `forward_logits()`：一次模型计算从 ID 到 Logits
 
-第一层是 model graph：
+`src/models/gpt_model.cpp`：
 
 ```text
-Embedding
-→ Transformer Blocks × N
+Token IDs
+→ Embedding
+→ Block × N
 → Final RMSNorm
-→ vocabulary projection
+→ Embedding weight projection
+→ Logits
 ```
-
-第二层是 generation orchestration：
-
-```text
-Prefill
-→ sample
-→ Decode loop
-→ EOS filtering
-→ cache cleanup
-```
-
-第一次读 `gpt_model.cpp` 时，最好先分开理解这两层。
-
----
-
-## 16. 一次 `forward_logits()` 的数据流
 
 ```mermaid
-flowchart TB
-    I[Token IDs]
-    E[Embedding]
-    B[Transformer Blocks x N]
+flowchart LR
+    I[IDs B x S]
+    E[Embedding B x S x H]
+    B[Blocks x N]
     N[Final RMSNorm]
-    W[Embedding Weight]
-    L[Logits]
+    L[Logits B x S x V]
 
-    I --> E
-    E --> B
-    B --> N
-    N --> W
-    W --> L
+    I --> E --> B --> N --> L
 ```
 
 **这张图最需要记住什么：**
 
-当前输出 vocabulary projection 直接复用 embedding weight，也就是 **weight tying（输入 embedding 与输出投影共享权重）**。
+`forward_logits()` 到 logits 就结束，Softmax 和 Sampling 在调用者后面做；当前 LM head 复用 embedding weight，也就是 **weight tying（输入 embedding 与输出投影共享权重）**。
 
-`GptModel` 头文件虽然还保留 `out_linear_` 成员，但当前 executable call path 没有使用它。读架构必须跟调用链，而不是根据成员名猜。
-
----
-
-## 17. Prefill 为什么处理完整 Prompt
-
-假设 Prompt 有 100 token：
-
-```text
-[t0, t1, ..., t99]
-```
-
-第一次 forward 必须让所有历史位置经过所有 Transformer layers，目的有两个：
-
-1. 得到最后位置的 next-token distribution；
-2. 为每一层建立历史 K/V。
-
-这一步叫 **Prefill**。
+`GptModel` 头文件里即使有看似相关的成员，也必须以 executable call path 为准，不能根据名字猜真实架构。
 
 ---
 
-## 18. Decode 为什么只需要一个新 token
+## 15. Prefill：输入和输出到底是什么
 
-Prefill 产生 `t100` 后，下一轮只输入：
-
-```text
-[t100]
-```
-
-`t0...t99` 的 K/V 已在 cache 中。
-
-因此 Decode 每轮：
+`GptModel::prefill()` 输入：
 
 ```text
-新 token
-→ 只计算新 Q/K/V
-→ 新 K/V append 到 cache
-→ Q 与历史 K cache 计算 attention
-→ sample next token
+input_tokens: [B, S]
+pos_offsets : [B]
+sample_ids  : [B]
 ```
 
-这就是 KV cache 能显著减少自回归重复计算的原因。
+进入模型后：
+
+```text
+Embedding    [B,S,H]
+Blocks       [B,S,H]
+Logits       [B,S,V]
+Probabilities[B,S,V]
+```
+
+但 next token 只取最后位置：
+
+```text
+probabilities[:, S-1, :]
+→ [B,1,V]
+→ sample B 个 token IDs
+```
+
+同时所有层的 K/V cache 增加 `S` 个位置。
+
+Prefill 之后：
+
+```cpp
+ctx.step = ctx.input_seq_len;
+```
+
+注意 `input_seq_len` 是 padding 后 batch width。
 
 ---
 
-## 19. 生成状态机
+## 16. Decode：为什么输入 shape 突然变成 `[B,1]`
+
+上一轮已经为每个 active sample 得到：
+
+```text
+next_generated_tokens = [tA, tB, ...]
+```
+
+`build_decode_step_tokens()` 把它变成：
+
+```text
+[[tA], [tB], ...]
+```
+
+即：
+
+```text
+input IDs [B,1]
+→ hidden [B,1,H]
+→ logits [B,1,V]
+→ sample [B]
+```
+
+历史 token 不再作为 input IDs 重放，因为历史 K/V 已经保留。
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Prefill
-    Prefill --> Finished: first token is EOS
-    Prefill --> Decode: sample still active
-    Decode --> Decode: next token, not EOS, below limit
-    Decode --> Finished: EOS or max_steps
-    Finished --> [*]: clear/reset KV cache
+sequenceDiagram
+    participant G as GptModel
+    participant A as SelfAttn
+    participant K as KV Cache
+    participant P as Sampler
+
+    G->>A: Decode [new token]
+    A->>K: read old K/V
+    A->>K: append new K/V
+    A-->>G: hidden state
+    G->>P: logits -> softmax
+    P-->>G: next token
 ```
 
 **这张图最需要记住什么：**
 
-EOS 不只是“while loop 停止”。一个 batch 中某个 sample 结束后，它会从 active set 移除，并清掉自己的 KV cache；其他 sample 可以继续 Decode。
+Decode 的性能优势来自“避免重新计算旧 token 的 K/V”，不是因为模型变成了另一套网络。
 
 ---
 
-## 20. `GenerationContext` 保存什么
+## 17. `GenerationContext`：一次固定 batch 生成的临时状态
 
-单次 `GptModel::forward()` 内部维护：
+它保存：
 
 ```text
 batch_size
@@ -673,55 +934,75 @@ pad_lens
 pos_lens_by_sample
 ```
 
-最重要的是三类身份/状态：
+其中最容易混淆的是三组状态。
 
-### `sample_ids`
+### 17.1 `sample_ids`：稳定身份，不是当前 batch row
 
-稳定的原始 sample 身份。
-
-开始可能是：
+初始：
 
 ```text
-[0, 1, 2]
+sample_ids = [0, 1, 2]
 ```
 
-sample 1 EOS 后：
+sample 1 遇到 EOS 后：
 
 ```text
-[0, 2]
+sample_ids = [0, 2]
 ```
 
-当前 batch row 1 已经代表 sample 2，因此 batch row 不能当永久身份。
+现在 batch row 1 对应 original sample 2。
 
-### `next_generated_tokens`
+因此：
+
+```text
+current row index ≠ stable sample identity
+```
+
+### 17.2 `next_generated_tokens`
 
 每个 active sample 下一轮要喂回模型的 token。
 
-### `pos_lens_by_sample`
+### 17.3 `pos_lens_by_sample`
 
-每个 sample 自己当前走到的真实 position。
-
-这三个状态共同支撑 variable-length generation。
+每个 sample 自己当前的真实 position 长度。Decode 时 RoPE offset 按这个 stable sample ID 查询。
 
 ---
 
-## 21. `max_steps`：README/help 与 executable semantics 有偏差
+## 18. EOS 不只是停止循环，还会改变 active set 和资源
 
-CLI help 看起来像：
+```mermaid
+stateDiagram-v2
+    [*] --> Prefill
+    Prefill --> Finished: first token is EOS
+    Prefill --> Decode: still active
+    Decode --> Decode: token != EOS and below limit
+    Decode --> Finished: EOS or limit
+    Finished --> [*]: clear KV
+```
+
+**这张图最需要记住什么：**
+
+batch 里某一个 sample 完成后，会从 active set 中移除，并清理自己的 KV Cache；其他 sample 可以继续运行。所以 EOS filtering 同时是生成状态管理和资源生命周期管理。
+
+---
+
+## 19. `--max-steps` 不是常见 API 的 `max_new_tokens`
+
+CLI help 写的是：
 
 ```text
 Maximum generation steps per request
 ```
 
-但当前代码更接近**总 step / position ceiling**，不是常见 API 的 `max_new_tokens`。
+但 executable semantics 更接近**总 step/position ceiling**。
 
-Prefill 已经采出第一个 token，然后：
+Prefill 已经生成第一枚 token，然后：
 
 ```cpp
 ctx.step = ctx.input_seq_len;
 ```
 
-Decode 条件是：
+Decode：
 
 ```cpp
 while (ctx.step < ctx.max_steps) {
@@ -730,32 +1011,32 @@ while (ctx.step < ctx.max_steps) {
 }
 ```
 
-因此近似最大新 token 数为：
+所以单条请求近似最多生成：
 
 ```text
 max_steps - input_seq_len + 1
 ```
 
-Continuous 模式甚至显式写成：
+Continuous 模式甚至直接计算：
 
 ```cpp
 max_generate_tokens = std::max(1, config_.max_steps - seq_len + 1);
 ```
 
-### 两个进一步影响
+两个后果：
 
-1. chat template 会占用 `input_seq_len`，所以肉眼只有几个字的 Prompt 也可能已有几十个 token；
-2. 普通多 Prompt batch 的 `input_seq_len` 是 padding 后的 batch 最大长度，因此短 Prompt 的总 step ceiling 也会受最长 Prompt 影响。
+1. chat template 会占用 token 长度；
+2. 普通多 Prompt batch 的 `input_seq_len` 是 padding 后最大宽度，短 Prompt 也会受到最长 Prompt 的影响。
 
-这属于明确的 documentation drift，使用 API 时不要把 `--max-steps` 机械映射成 `max_new_tokens`。
+这是当前 README/help 与实际语义之间需要明确知道的 documentation drift。
 
 ---
 
 # 第五部分：进入一个 Transformer Block
 
-## 22. Block 的真实顺序
+## 20. Block 的真实执行顺序
 
-`src/models/block.cpp` 很短：
+`src/models/block.cpp` 表面只有几行：
 
 ```cpp
 auto output_attn = self_attn_.forward(input, sample_ids, pos_offsets);
@@ -764,175 +1045,259 @@ auto output = mlp_.forward(output_attn);
 ops::add_inplace(output, output_attn);
 ```
 
-但 `RMSNorm` 分别封装在 `SelfAttn` 和 `MLP` 内，所以完整结构是：
+但 RMSNorm 分别封装在 `SelfAttn` 和 `MLP` 内，所以完整结构是：
 
 ```text
-input
+x
 → RMSNorm
 → Self-Attention
-→ + residual(input)
+→ + x
 → RMSNorm
-→ gated MLP
+→ Gated MLP
 → + residual
 ```
 
-这就是当前 Qwen-style pre-norm decoder block。
+输入输出 shape 都保持：
 
----
-
-## 23. Attention 先只看数据流
-
-```mermaid
-flowchart TB
-    X[Hidden States]
-    N[RMSNorm]
-    Q[Q Projection]
-    K[K Projection]
-    V[V Projection]
-    R[RoPE on Q/K]
-    C[Append / Read KV Cache]
-    A[Q x K + Masks + Softmax]
-    O[Attention x V]
-    P[O Projection]
-
-    X --> N
-    N --> Q
-    N --> K
-    N --> V
-    Q --> R
-    K --> R
-    R --> C
-    V --> C
-    C --> A
-    A --> O
-    O --> P
+```text
+[B,S,H] → [B,S,H]
 ```
 
-**这张图最需要记住什么：**
-
-这个项目里 Self-Attention 最值得学的不是公式本身，而是：**不同 sample 的历史 K/V 怎么保存、这一轮 active batch 怎么重新拼、position 和 padding 又怎么保持正确。**
-
 ---
 
-## 24. Shape 是读 Attention 最有效的语言
+## 21. Self-Attention：先追 shape，再看公式
 
 设：
 
 ```text
-B    = batch size
-S    = current sequence length
-H    = num_heads
-HKV  = num_key_value_heads
-D    = head_dim
-hidden = H × D
+B   = batch
+S   = current input sequence length
+Hq  = query heads
+Hkv = key/value heads
+D   = head_dim
+M   = hidden_size = Hq × D
+```
+
+Qwen2.5-0.5B 的真实结构参数：
+
+```text
+M   = 896
+Hq  = 14
+Hkv = 2
+D   = 64
 ```
 
 输入：
 
 ```text
-[B, S, hidden]
+X: [B,S,896]
 ```
 
-Q/K/V projection 后：
+projection 后：
 
 ```text
-Q: [B, S, H × D]
-K: [B, S, HKV × D]
-V: [B, S, HKV × D]
+Q: [B,S,896] = [B,S,14×64]
+K: [B,S,128] = [B,S, 2×64]
+V: [B,S,128] = [B,S, 2×64]
 ```
 
-split heads + transpose：
+split head + transpose：
 
 ```text
-Q: [B, H,   S, D]
-K: [B, HKV, S, D]
-V: [B, HKV, S, D]
+Q: [B,14,S,64]
+K: [B, 2,S,64]
+V: [B, 2,S,64]
 ```
 
-当前 CPU baseline 随后执行：
+当前 CPU 路径随后：
 
 ```cpp
 k.repeat(num_heads_ / num_heads_kv_, 1);
 v.repeat(num_heads_ / num_heads_kv_, 1);
 ```
 
-得到：
+所以 K/V 被物理 repeat 成：
 
 ```text
-K/V: [B, H, S, D]
+K: [B,14,S,64]
+V: [B,14,S,64]
 ```
 
-这就是当前 GQA 的简单实现：逻辑上多个 Query heads 共享较少的 KV heads，但 CPU 路径为了计算直观，先物理 repeat K/V。
+这是项目当前 GQA（Grouped Query Attention，分组查询注意力）的直接实现。
 
-一个重要后果是：**当前 CPU KV cache 保存的是 repeat 后的 heads**，因此不要直接把理论 GQA 的 KV 内存节省量套到这个实现上。
+重要设计事实：理论上的 GQA 可以减少 KV heads，但**当前 CPU cache 保存的是 repeat 后的 K/V**，所以不能把理论 KV 内存节省比例直接套到当前 CPU 实现。
 
 ---
 
-## 25. RoPE：left padding 后位置为什么仍然正确
+## 22. Attention 的输入输出，用一个缩小矩阵看清楚
 
-RoPE（Rotary Position Embedding，旋转位置编码）会按 position 旋转 Q/K。
+实际 head_dim=64、heads=14，不适合手画。下面用 1 个 head、3 个 token 做缩小示意。
 
-假设：
-
-```text
-PAD PAD real0 real1 real2
-```
-
-数组 index 是：
+假设某个 head 的 Q/K 计算得到 score matrix：
 
 ```text
-0   1   2     3     4
+           key0  key1  key2
+query0      1.2   0.7  -0.2
+query1      0.5   1.4   0.8
+query2     -0.1   0.9   1.7
 ```
 
-如果直接使用 index，`real0` 会错成 position 2。
+自回归模型不能“看未来”，加 causal mask：
 
-Prefill 当前构造：
+```text
+           key0  key1  key2
+query0      1.2  -inf  -inf
+query1      0.5   1.4  -inf
+query2     -0.1   0.9   1.7
+```
+
+再：
+
+```text
+scale by 1/sqrt(D)
+→ softmax each row
+→ attention weights
+→ weights × V
+```
+
+最后回到：
+
+```text
+[B,heads,S,D]
+→ transpose/reshape
+→ [B,S,896]
+→ o_proj
+→ [B,S,896]
+```
+
+这些 score 数字只是数学示意；真实值由模型权重和 hidden states 决定。
+
+---
+
+## 23. Attention 里其实有三种不同的 Mask
+
+不要把它们全部叫“padding mask”。
+
+### 23.1 Causal Mask
+
+Prefill 时当前位置不能看未来 token。
+
+### 23.2 Padding Mask
+
+Prompt 左侧 PAD 不能成为有效历史信息。
+
+### 23.3 Valid-length Mask
+
+不同 active sample 的 KV Cache 长度可能不同。为了临时拼成规则 Tensor，短 cache 尾部补 0，但这些补出来的位置不能参与 Attention。
+
+例如：
+
+```text
+sample 0 cache len = 3
+sample 2 cache len = 5
+```
+
+临时 batch：
+
+```text
+sample 0: [K0 K1 K2  0  0]  valid_len=3
+sample 2: [K0 K1 K2 K3 K4]  valid_len=5
+```
+
+`apply_valid_length_mask()` 会把 sample 0 后两个 score 设为 `-inf`。
+
+---
+
+## 24. RoPE：position 为什么不能直接等于数组下标
+
+RoPE（Rotary Position Embedding，旋转位置编码）把 position 信息作用到 Q/K。
+
+Prefill 时：
 
 ```text
 offset = -pad_len
 ```
 
-当 `pad_len=2`：
+Decode 时：
 
 ```text
-array index: 0  1  2  3  4
-offset:     -2 -2 -2 -2 -2
-RoPE pos:   -2 -1 0  1  2
+offset = pos_lens_by_sample[sample_id]
 ```
 
-PAD 本身随后被 mask，真实 token 从 position 0 开始。
+这两条规则由 `generation_invariants.cpp` 显式实现，并有测试保护。
 
-Decode 时使用每个 sample 的：
-
-```text
-pos_lens_by_sample[sample_id]
-```
-
-所以 batch 中不同长度 sample 可以拥有不同 position。
-
-`generation_invariants_test.cpp` 明确保护这些规则。
+设计重点不是“负 position 有什么语义”，而是：真实 token 从 position 0 开始，PAD 会被 mask；每个 sample 在 Decode 时又有自己的独立 position。
 
 ---
 
-## 26. Attention Mask 其实解决三种不同问题
+## 25. KV Cache：真正的历史状态保存在每一层 `SelfAttn`
 
-### Causal Mask
+每层都有：
 
-Prefill 中，当前位置不能看未来 token。
+```text
+cache_k_by_sample_
+cache_v_by_sample_
+cache_len_by_sample_
+pad_lens_by_sample_
+```
 
-### Valid-length Mask
+N 层模型不是“只有一份 KV Cache”，而是 N 组 layer-specific history。
 
-不同 sample 的 KV cache 长度不同。临时拼成规则 batch 后，较短 cache 的尾部是补出来的，必须 `-inf` mask。
+### 25.1 Append 的真实方向
 
-### Padding Mask
+Prefill：
 
-Prompt 左侧真实 PAD 不能进入 Attention。
+```text
+K/V new: [1,heads,S,D]
+cache empty
+→ cache = S positions
+```
 
-这三种 mask 的原因不同，不要都叫“padding”。
+Decode：
+
+```text
+K/V new: [1,heads,1,D]
+old cache: [1,heads,L,D]
+→ concat on sequence dimension
+→ [1,heads,L+1,D]
+```
+
+`append_kv_cache()` 是按 stable `sample_id` 做这个 concat。
+
+### 25.2 为什么 cache 不能按当前 row 保存
+
+假设：
+
+```text
+round 0 active rows: [sample 0, sample 1, sample 2]
+```
+
+sample 1 结束：
+
+```text
+round 1 active rows: [sample 0, sample 2]
+```
+
+此时 row 1 已从 sample 1 变成 sample 2。
+
+```mermaid
+flowchart LR
+    R[Active rows: 0, 2]
+    C0[Cache sample 0]
+    C1[Cache sample 1 cleared]
+    C2[Cache sample 2]
+
+    R --> C0
+    R --> C2
+```
+
+**这张图最需要记住什么：**
+
+`sample_id` / `slot_id` 是稳定 cache identity；batch row 只是当前这一轮的位置。动态 batch 能正确缩小、重排，全靠这两个概念分开。
 
 ---
 
-## 27. RMSNorm 和 MLP 的当前实现
+## 26. `RMSNorm` 与 Gated MLP
 
 `RMSNorm::forward()`：
 
@@ -943,252 +1308,271 @@ mean(x²)
 → × learned weight
 ```
 
-当前 `epsilon` 直接写死为：
+当前代码把：
 
 ```text
-1e-6
+epsilon = 1e-6
 ```
 
-`Config` 没有读取模型的 `rms_norm_eps` 字段。默认 Qwen2.5-0.5B 与该值匹配，但支持其他模型时这是一个真实适配点。
+写死在 `src/models/norm.cpp`，没有从 `Config` 读取 `rms_norm_eps`。官方 Qwen2.5-0.5B 恰好也是 `1e-6`，所以默认模型匹配，但支持新模型时这是适配点。
 
 `MLP::forward_cpu()`：
 
 ```text
 x
 → RMSNorm
-→ up_proj(x)
-→ gate_proj(x)
-→ SiLU(gate)
-→ up * gate
-→ down_proj
+├→ up_proj ───────────┐
+└→ gate_proj → SiLU ─┤ multiply
+                     ↓
+                  down_proj
 ```
 
-这不是简单的 `Linear → ReLU → Linear`，而是 gated MLP。
+它不是简单的 `Linear → ReLU → Linear`，而是 gated MLP。
 
 ---
 
-# 第六部分：KV Cache——理解动态 batch 的核心
+# 第六部分：Sampling——模型如何从 15 万多个候选中选一个
 
-## 28. KV Cache 到底保存在哪里
-
-每一个 Transformer layer 的 `SelfAttn` 都有：
-
-```text
-cache_k_by_sample_
-cache_v_by_sample_
-cache_len_by_sample_
-pad_lens_by_sample_
-```
-
-所以不是“整个模型只有一份 cache”。N 层模型会有 N 组 layer-specific K/V history。
-
----
-
-## 29. 为什么 cache 必须按稳定 sample identity 保存
-
-初始：
-
-```text
-sample_ids = [0, 1, 2]
-```
-
-sample 1 完成后：
-
-```text
-active sample_ids = [0, 2]
-```
-
-这一轮 batch row 1 已经是 sample 2。
-
-```mermaid
-flowchart LR
-    A[Current active rows: 0, 2]
-    C0[Cache identity 0]
-    C1[Cache identity 1 cleared]
-    C2[Cache identity 2]
-
-    A --> C0
-    A --> C2
-```
-
-**这张图最需要记住什么：**
-
-`sample_id` / `slot_id` 是稳定的 cache identity；batch row 只是“这一轮排在第几行”。只有把这两者分开，active batch 才能自由缩小和重排。
-
----
-
-## 30. `build_padded_active_cache()` 为什么存在
-
-假设：
-
-```text
-sample 0 cache length = 20
-sample 2 cache length = 37
-```
-
-长期状态仍按 sample 独立保存，但当前矩阵计算需要规则 Tensor，所以临时构造：
-
-```text
-[active_batch, heads, max_cache_len, head_dim]
-```
-
-短 cache 尾部补 0，同时返回：
-
-```text
-valid_lens = [20, 37]
-```
-
-`apply_valid_length_mask()` 再把 sample 0 的 20 以后 score 全设为 `-inf`。
-
-这种设计非常适合教学和 correctness：**长期 cache 独立，计算时才把当前 active set 拼起来。**
-
-成熟 serving framework 可能使用 paged/block KV cache，但那不是当前 repo 的实现，不应反推到这里。
-
----
-
-## 31. EOS 为什么会触发资源清理
-
-EOS filter 得到已经结束的 sample 后，会：
-
-```cpp
-clear_kv_cache(sample_id);
-```
-
-原因：
-
-- 已完成 sample 不再 Decode；
-- K/V 不应继续占状态；
-- Continuous 模式中的 slot 还要复用。
-
-这说明 EOS filtering 同时属于**生成状态管理**和**资源生命周期管理**。
-
-另一个当前行为：生成 token 会先被记录，再做 EOS filter，因此 EOS special token 本身可能进入 generated IDs，展示层并没有统一做“隐藏 stop token”的 API 策略。
-
----
-
-# 第七部分：Sampling 与单次输出
-
-## 32. Logits 怎样变成 next token
+## 27. Logits、Softmax、Sampling 是三个不同阶段
 
 模型输出：
 
 ```text
-logits: [batch, seq, vocab]
+logits [B,S,V]
 ```
 
-`forward_logits()` 到这里结束；Prefill / Decode 的调用者随后执行 `ops::softmax()`，得到 float probabilities，再交给 Sampler。
+`forward_logits()` **不会**做 softmax。
 
-`TopKTopPSampler` 的当前实现要分成两条权重理解：
+Prefill / Decode 调用者随后：
 
 ```text
-probabilities
-├─ base_weight = p
-│  └─ sort → Top-K → Top-P，决定候选集合
-└─ sample_weight = p^(1 / temperature)
-   └─ 只用于候选集合内的最终随机抽样
+logits
+→ ops::softmax()
+→ probabilities
+→ Sampler::sample_from_probs()
+→ token ID
 ```
 
-`--greedy` 则直接选最大概率 token。
-
-### Temperature 的真实实现
-
-当前代码在 softmax 后计算：
-
-```text
-sample_weight = p^(1 / temperature)
-```
-
-在重新归一化后，这和常见的 `logits / T → softmax` 有相同的 temperature 变换数学含义；但**当前 Top-P 截断边界仍按原始 `base_weight` 计算**，temperature 不会改变候选集合，只会改变保留下来的候选之间的随机权重。
-
-因此不要把当前实现简写成“temperature → Top-P → sample”。做 Hugging Face 等框架的 sampling parity 时，这个执行语义差异必须单独核对。
+这是读代码时非常重要的边界。
 
 ---
 
-## 33. 单次模式输出到底归谁
+## 28. 用一个 3-token mini vocabulary 看清 Sampling
 
-`GptModel::forward()` 的 `std::string` return 当前并不是最终结果渠道：
+假设 vocabulary 只有：
+
+```text
+A, B, C
+```
+
+某一步 logits：
+
+```text
+A: 2.0
+B: 1.0
+C: 0.0
+```
+
+Softmax 约为：
+
+```text
+A: 0.665
+B: 0.245
+C: 0.090
+```
+
+### 28.1 Greedy
+
+```text
+max probability = A
+→ 直接返回 A
+```
+
+### 28.2 Temperature：当前代码作用在 probability 上
+
+`TopKTopPSampler` 当前计算：
+
+```text
+adjusted_weight = p^(1 / temperature)
+```
+
+例如 `T = 0.5`：
+
+```text
+A: 0.665² ≈ 0.442
+B: 0.245² ≈ 0.060
+C: 0.090² ≈ 0.008
+```
+
+重新归一化后大约：
+
+```text
+A: 0.867
+B: 0.118
+C: 0.016
+```
+
+这和常见的：
+
+```text
+logits / T → softmax
+```
+
+在数学上等价于同一种 temperature reweighting（差一个统一归一化常数）。
+
+### 28.3 当前真实执行顺序
+
+代码不是“Top-P 后再 Temperature”，而是：
+
+```text
+softmax probabilities
+→ p^(1/T)
+→ sort
+→ Top-K
+→ recompute total
+→ Top-P cumulative cutoff
+→ random sample
+```
+
+```mermaid
+flowchart LR
+    L[Logits]
+    S[Softmax]
+    T[p to p^(1/T)]
+    K[Top-K]
+    P[Top-P]
+    R[Random sample]
+
+    L --> S --> T --> K --> P --> R
+```
+
+**这张图最需要记住什么：**
+
+Temperature 在候选截断之前生效。对正 probability 来说 `p^(1/T)` 不改变大小排序，所以通常不改变 Top-K 的 token 身份；但它会改变累计权重，因此**可能改变 Top-P 的截断边界**。
+
+例如上面的分布，若 `top_k=0, top_p=0.8`：
+
+```text
+T=1.0: A=0.665，不到 0.8 → 还需要 B → 候选 {A,B}
+T=0.5: A≈0.867，已超过 0.8 → 候选只剩 {A}
+```
+
+这正是当前 executable code 的语义。
+
+---
+
+## 29. RNG state 归谁
+
+`GptModel` 持有：
+
+```text
+std::mt19937 rng_
+Sampler
+```
+
+seed 来自 CLI/config。
+
+所以当前 RNG state 是**模型级**的，而不是 per-request RNG state。
+
+这在固定 batch 里很简单；如果未来 Continuous Batching 要求“每个 request 指定自己的 seed，且不受其他请求到达顺序影响”，就必须重新设计 sampling state ownership。
+
+---
+
+## 30. 单次模式的最终输出为什么在 `DataManager`
+
+`GptEngine`：
 
 ```cpp
 auto output = model_->forward(batch);
 (void)output;
+data_manager_->log_outputs(output_path);
 ```
 
-生成过程中真正执行的是：
+说明 `GptModel::forward()` 的 string return 当前不是结果主渠道。
 
-```cpp
-data_manager_.add_output_token(...);
-```
-
-最后：
+真正路径：
 
 ```text
-DataManager::outputs_
-→ Tokenizer::decode(generated IDs)
-→ log_outputs()
+sample token ID
+→ DataManager::add_output_token()
+→ outputs_[sample_id].token_ids
+→ Tokenizer::decode()
+→ final text
 ```
 
-因此单次模式：
+所以：
 
-> **`GptModel` 负责产生 token；`DataManager` 负责保存和最终 decode。**
+```text
+GptModel = 产生 token
+DataManager = 单次模式下保存生成 token + 最终 decode
+```
 
-这是 side-effect based 的 API 设计。如果未来把模型做成更通用 library，这里是很自然的重构边界。
+如果未来把 `GptModel` 做成更通用 library，这个 side-effect based 输出边界很值得重构。
 
 ---
 
-# 第八部分：Continuous Batching
+# 第七部分：Continuous Batching——多个请求如何共用一个模型
 
-## 34. `--serve` 到底是什么
+## 31. `--serve` 不是 HTTP Server
+
+启动：
 
 ```bash
 ./build/easy_llm --serve
 ```
 
-当前行为：
+当前协议：
 
-- input thread 从 stdin 每行读一个 Prompt；
-- `submit_prompt()` 放进 pending queue；
-- server 主循环持续 admission + decode；
-- 完成时 stdout 输出整段文本；
-- `/quit` / `:quit` 停止接收新输入，已有请求继续收尾。
+```text
+stdin : one prompt per line
+stdout: [accepted id]
+stdout: [request id] final decoded text
+```
 
-它没有 socket、HTTP、REST、SSE、WebSocket 或 gRPC。
+输入 thread 负责读 stdin；server 主循环负责模型执行。
+
+没有：
+
+```text
+HTTP / REST / SSE / WebSocket / gRPC
+network auth
+durable request store
+```
 
 ---
 
-## 35. Continuous Batching Golden Path
+## 32. Continuous Batching Golden Path
 
 ```mermaid
 sequenceDiagram
-    participant I as stdin thread
-    participant S as ContinuousBatchServer
+    participant I as Input Thread
+    participant S as Batch Server
     participant T as Tokenizer
     participant G as GptModel
-    participant K as SelfAttn KV Cache
+    participant K as KV Cache
     participant O as stdout
 
     I->>S: submit_prompt()
-    S->>S: enqueue PendingPrompt
-    S->>T: tokenize admission candidates
-    S->>S: assign free slot + left pad
-    S->>G: sample_prefill_continuous()
-    G->>K: create/update per-slot KV
-    loop each decode round
-        S->>G: sample_decode_continuous(active slots)
-        G->>K: append KV for active slots
+    S->>S: PendingPrompt queue
+    S->>T: tokenize candidates
+    S->>S: allocate slot + left pad
+    S->>G: prefill(active admissions)
+    G->>K: create per-slot KV
+    loop each round
+        S->>G: decode(active slots)
+        G->>K: append per-slot KV
     end
-    S->>G: clear_continuous_sample(slot)
-    S->>O: [request id] decoded text
+    S->>G: clear finished slot
+    S->>O: final decoded text
 ```
 
 **这张图最需要记住什么：**
 
-Continuous Batching 不是“每个请求启动一个模型线程”。它是：
-
-> **一个调度循环，每一轮重新组合 active requests；稳定 slot 让每个 request 的 KV history 不随 batch row 改变。**
+Continuous Batching 不是“每个请求一个模型线程”。它是**一个 scheduler/model loop，每轮重新组合当前 active requests；stable slot 保证 KV history 不跟 batch row 一起漂移。**
 
 ---
 
-## 36. 三种 request state
+## 33. Request 有三种主要状态
 
 ### `PendingPrompt`
 
@@ -1198,7 +1582,7 @@ prompt_text
 submit_time
 ```
 
-还没有占 KV slot。
+还没有占用 KV slot。
 
 ### `PreparedAdmission`
 
@@ -1212,7 +1596,7 @@ max_generate_tokens
 token_ids
 ```
 
-本轮准备 Prefill，已经 tokenized 并拿到 slot。
+已经 tokenize，拿到 slot，准备做 Prefill。
 
 ### `ActiveRequest`
 
@@ -1226,92 +1610,116 @@ generated_token_ids
 decode_steps
 ```
 
-正在 Decode。
+正在参与 Decode。
 
 ```mermaid
 stateDiagram-v2
     [*] --> Pending
-    Pending --> Prepared: admission + free slot
-    Prepared --> Active: prefill generated first token
-    Prepared --> Finished: EOS / generation limit
+    Pending --> Prepared: free slot + tokenize
+    Prepared --> Active: prefill first token
+    Prepared --> Finished: EOS / limit
     Active --> Active: decode one token
-    Active --> Finished: EOS / generation limit
-    Finished --> [*]: clear KV + return slot
+    Active --> Finished: EOS / limit
+    Finished --> [*]: clear KV + free slot
 ```
 
 **这张图最需要记住什么：**
 
-`request_id` 是 request identity；`slot_id` 是 cache resource identity。请求结束后 slot 会复用，所以两者不能混用。
+`request_id` 是业务请求身份；`slot_id` 是 cache resource identity。请求完成后 slot 会给另一个 request 复用，两者绝不能混为一谈。
 
 ---
 
-## 37. Scheduler 每轮做什么
+## 34. 用时间线看 Dynamic Batch 为什么叫 Continuous
 
-`ContinuousBatchServer::run()` 的骨架：
-
-```cpp
-while (true) {
-    admit_prefill_round();
-    decode_round();
-    maybe_log_runtime_stats();
-    if (is_done()) break;
-    ...
-}
-```
-
-即：
+假设：
 
 ```text
-先接纳一批新请求做 Prefill
-→ 再让所有 active request Decode 一步
+max_active=3
+prefill_batch_size=2
 ```
 
-两个关键容量参数：
+请求 A/B 已到达，C 晚一轮到达。
+
+| Round | Admission | Prefill batch | Decode batch | round 后 active |
+|---|---|---|---|---|
+| 0 | A, B | `[A,B]` | `[A,B]` 各走 1 token | A, B |
+| 1 | C | `[C]` | `[A,B,C]` 各走 1 token | A, B, C |
+| 2 | 无 | - | `[A,B,C]` | 假设 B 完成 |
+| 3 | 无 | - | `[A,C]` | A, C |
+
+这就是“continuous”的核心：
 
 ```text
---serve-max-active
---serve-prefill-batch
+请求不必等整个旧 batch 全部结束，新的请求可以在有 free slot 时进入下一次 Prefill round。
 ```
 
-当前没有 priority、preemption、deadline-aware scheduling 等更复杂策略。
+### 34.1 每一轮输入输出也很具体
+
+Prefill round：
+
+```text
+输入:
+  sample_ids  = [slotA, slotB]
+  input_tokens= 两条 left-padded Prompt
+  pos_offsets = [-padA, -padB]
+输出:
+  sampled     = [firstTokenA, firstTokenB]
+  KV          = 每个 slot 建立 Prompt history
+```
+
+Decode round：
+
+```text
+输入:
+  sample_ids  = [slotA, slotB, slotC]
+  input_tokens= [[nextA],[nextB],[nextC]]
+  pos_offsets = [posA,posB,posC]
+输出:
+  sampled     = [newA,newB,newC]
+  KV          = 每个 active slot 各 append 1 position
+```
 
 ---
 
-## 38. Free Slot 为什么是资源管理核心
+## 35. Free Slot 是 Continuous 模式的资源管理中心
 
-服务启动时准备：
+服务启动时：
 
 ```text
-slot 0 ... slot N-1
+free_slots = 0..N-1
 ```
 
 Admission：
 
 ```text
-free slot → request.slot_id
+free slot
+→ PreparedAdmission.slot_id
+→ model KV identity
 ```
 
 Finish：
 
 ```text
-clear_continuous_sample(slot_id)
+clear_continuous_sample(slot)
 → pad_len reset
-→ slot_id return to free_slots_
+→ slot returned to free_slots
 ```
 
-这样模型 cache 可以用稳定 slot 管理，而不是把请求身份绑在当前 batch row 上。
+所以 slot 不是“request number”，而是**有限模型状态资源**。
 
 ---
 
-## 39. Continuous 模式下输出为什么不再归 `DataManager`
+## 36. Continuous 模式为什么不使用 `DataManager::outputs_`
 
-服务请求不断动态进入/退出，所以生成 IDs 保存在：
+单次模式是固定 batch，`DataManager` 可以一开始就创建平行的 input/output arrays。
+
+服务模式请求会动态进出，所以生成状态保存在：
 
 ```text
 ActiveRequest::generated_token_ids
 ```
 
-请求结束时直接：
+finish 时：
 
 ```cpp
 std::string text = tokenizer_.decode(request.generated_token_ids);
@@ -1321,125 +1729,142 @@ std::string text = tokenizer_.decode(request.generated_token_ids);
 
 | 状态 | 单次模式 | Continuous 模式 |
 |---|---|---|
-| Prompt/input batch | `DataManager` | pending/prepared request |
+| 输入 request | `DataManager::inputs_` | pending/prepared request |
 | Generated IDs | `DataManager::outputs_` | `ActiveRequest` |
-| Lifecycle | 固定 batch | Pending → Active → Finished |
-| KV cache | 每层 `SelfAttn` | 每层 `SelfAttn`，按 slot |
-
-这就是为什么 `GptModel` 单独提供：
-
-```text
-sample_prefill_continuous()
-sample_decode_continuous()
-clear_continuous_sample()
-```
-
-而不是强迫 Continuous 模式使用固定 `DataManager` batch。
+| Request lifecycle | 固定 batch | Pending → Active → Finished |
+| KV history | 每层 `SelfAttn` | 每层 `SelfAttn`，按 slot |
 
 ---
 
-# 第九部分：State Ownership、Sync/Async、Protocol 边界
+## 37. Sync / Async 边界：哪里真的有线程
 
-## 40. 当前谁是“权威状态 owner”
-
-项目没有数据库，因此没有 durable system of record。运行时状态如下：
-
-| 状态 | Owner | 生命周期 |
-|---|---|---|
-| model config | `Config` | process/model |
-| 未消费权重 | `ModelParam` | startup only |
-| model weights | Embedding/Linear/Norm 等 | model |
-| 单次 input/output | `DataManager` | one CLI batch |
-| 单次 active generation | `GenerationContext` | one `forward()` |
-| service pending queue | `ContinuousBatchServer` | service process |
-| service active requests | `ContinuousBatchServer` | request |
-| CPU KV | each `SelfAttn` | sample/slot |
-| CUDA KV | each `SelfAttnCudaState` | sample/slot |
-
-进程崩溃后，这些请求/KV 状态都不会恢复。
-
----
-
-## 41. Sync / Async 边界
-
-### 普通 CLI
-
-基本同步：
+普通 CLI：
 
 ```text
-main
-→ GptEngine
-→ GptModel
-→ generation completes
-→ return
+main → GptEngine → GptModel → complete
 ```
 
-### `--serve`
+基本同步。
 
-显式线程边界只有：
+`--serve`：
 
 ```text
-input producer thread
+stdin producer thread
         ↓
-mutex-protected pending queue
+mutex-protected pending_prompts_
         ↓
-server/model thread
+server/model loop thread
 ```
 
-`pending_prompts_` 和 `input_closed_` 通过 `pending_mu_` 保护。
+`pending_prompts_` 和 `input_closed_` 用 `pending_mu_` 保护。
 
 而：
 
 ```text
 active_requests_
 free_slots_
-model execution
+model forward
 ```
 
 由 server 主循环单线程推进。
 
-OpenMP 和 CUDA 是**算子内部并行**，不等于 request-level 多线程执行。
+OpenMP/CUDA 属于 operator 内部并行，不等于“每个 request 一个线程”。
 
 ---
 
-## 42. Protocol / Integration Boundary：当前几乎没有网络协议层
+# 第八部分：State Ownership 与系统边界
 
-当前外部交互协议非常简单：
+## 38. 谁是每类状态的 owner
 
-```text
-stdin: one prompt per line
-stdout: completed result line
+项目没有数据库，因此也没有 durable system of record。当前运行时状态：
+
+| 状态 | Owner | 生命周期 |
+|---|---|---|
+| model config | `Config` | process/model |
+| startup weight map | `ModelParam` | startup |
+| model weights | Embedding/Linear/Norm | model |
+| 单次 input/output | `DataManager` | one CLI batch |
+| 单次生成临时状态 | `GenerationContext` | one `forward()` |
+| service pending queue | `ContinuousBatchServer` | service process |
+| service active request | `ContinuousBatchServer` | request |
+| CPU KV | each `SelfAttn` | sample/slot |
+| CUDA KV | each `SelfAttnCudaState` | sample/slot |
+| RNG | `GptModel` | model process |
+
+```mermaid
+flowchart TB
+    S[ContinuousBatchServer]
+    G[GptModel]
+    A1[Layer 0 SelfAttn]
+    A2[Layer ... SelfAttn]
+    D[DataManager]
+
+    S -->|request lifecycle| S
+    G -->|generation context / RNG| G
+    A1 -->|K/V per sample| A1
+    A2 -->|K/V per sample| A2
+    D -->|single-mode I/O| D
 ```
 
-因此当前不存在：
+**这张图最需要记住什么：**
+
+“状态存在”不是问题，“状态归谁”才是架构问题。请求状态、生成状态、KV 历史和输出状态有不同生命周期，所以不应该塞进一个全局对象。
+
+---
+
+## 39. 当前 Protocol / Integration Boundary 很薄
+
+当前对外 protocol：
+
+```text
+CLI args
+stdin lines
+stdout lines
+```
+
+不存在：
 
 ```text
 HTTP route
-request schema/version
-SSE
+JSON request schema
 callback
-network auth
-external persistence
+event bus
+SSE
+network authentication
 ```
 
-如果以后加 HTTP/gRPC，最自然的是在 `ContinuousBatchServer` 类似的 scheduler API 外面加 adapter，而不是让 transport 直接碰 `SelfAttn` cache。
+如果以后增加 HTTP/gRPC，合理结构是：
+
+```text
+HTTP/gRPC Adapter
+→ request lifecycle API
+→ ContinuousBatchServer-like scheduler
+→ GptModel
+```
+
+而不是：
+
+```text
+HTTP handler
+→ 直接改 SelfAttn KV cache
+```
+
+transport 层应该知道请求，不应该知道每层 K/V 的内部 layout。
 
 ---
 
-# 第十部分：CPU 与 CUDA Backend
+# 第九部分：CPU 与 CUDA——同一个模型的两个执行后端
 
-## 43. 为什么先读 CPU baseline
+## 40. 为什么学习时先读 CPU
 
-`Tensor` 本身非常轻：
+`Tensor` 的核心可以理解为：
 
-```cpp
-std::vector<data_type> data_;
-std::vector<int> shape_;
+```text
+std::vector<data_type> data
+std::vector<int> shape
 ```
 
-`reshape()` 改 shape metadata，但 `transpose()` / `repeat()` 会真正重排或复制数据，不是 stride view。
-
-CPU ops 也直接写出：
+CPU 代码把很多操作直接写出来：
 
 ```text
 matmul
@@ -1450,13 +1875,15 @@ concat
 MLP
 ```
 
-这种实现不是为了极致性能，而是让 shape、状态和数学步骤能直接追踪。
+`reshape()` 主要改 shape metadata，但 `transpose()` / `repeat()` 会真正重排/复制数据。
+
+因此 CPU baseline 最适合追踪“数据究竟怎么流”。
 
 ---
 
-## 44. 当前 precision 事实
+## 41. Precision：源码支持概念与标准 build 路径要分开
 
-代码结构有：
+代码有：
 
 ```text
 USE_FP32
@@ -1464,232 +1891,203 @@ USE_FP16
 USE_BF16
 ```
 
-但当前 `CMakeLists.txt` 对核心 target 固定定义：
+但当前 `CMakeLists.txt` 对核心 target 采用 BF16 路径。
 
-```cmake
-USE_BF16
-```
-
-因此标准构建实际是 BF16-first。
-
-很多 CPU kernel 会将 BF16 转成 float accumulation，再转回 `data_type`。
-
-Loader 能读 F16/F32/BF16 源权重，不代表三种 target precision 都已经以同等方式配置和测试。
+Loader 可以读取 F16/F32/BF16 源权重，不代表三种 target precision 都是当前同等验证的正式 build path。
 
 ---
 
-## 45. CUDA 是 operator backend，不是第二套模型
+## 42. CUDA 是 operator backend，不是第二套 `GptModel`
 
 ```mermaid
 flowchart TB
     M[GptModel / Blocks]
-    O[Common C++ operations]
-    C[CPU implementation]
-    G[CUDA implementation]
-    R[CudaContext + WeightCache]
-    K[CUDA per-sample KV State]
+    O[Ops / Components]
+    C[CPU path]
+    U[CUDA path]
+    R[CudaContext / weight cache]
+    K[CUDA KV state]
 
     M --> O
     O --> C
-    O --> G
-    G --> R
-    G --> K
+    O --> U
+    U --> R
+    U --> K
 ```
 
 **这张图最需要记住什么：**
 
-模型结构和 generation orchestration 仍是同一套 C++。CUDA 在下面替换/加速部分算子，并维护 device-side Attention state。
+Prefill/Decode、request state、Block 结构还是同一套 C++ orchestration；CUDA 主要替换底层计算，并在 Self-Attention 路径维护 device-side KV state。
 
 ---
 
-## 46. `CudaContext` 管什么
+## 43. 为什么普通 CUDA fallback 和 Self-Attention fallback 不一样
 
-`src/cuda/runtime.cu`：
+MLP/matmul CUDA 失败时，host input 仍然完整，通常可以 catch 后走 CPU。
 
-- 检测 device；
-- 检查当前 precision 支持；
-- 创建 non-blocking stream；
-- 创建 cuBLAS handle；
-- 管理 model weight upload cache。
+Self-Attention 有历史状态。
 
-Weight cache 让固定权重第一次用时上传 GPU，后续复用 device pointer，而不是每次 matmul 都重复传整个权重。
-
----
-
-## 47. 为什么普通 CUDA fallback 和 Self-Attention fallback 不一样
-
-普通 `matmul_3d` / MLP CUDA 失败时，host input 仍完整存在，所以可以 catch 后走 CPU。
-
-Self-Attention 不一定安全。
-
-如果历史 K/V 已经只存在 CUDA cache 中，当前 CUDA Attention 失败后直接切 CPU，会丢掉历史状态。
-
-因此当前规则是：
+如果旧 K/V 只存在 CUDA cache：
 
 ```text
-没有 active CUDA KV history
-→ 可以 disable CUDA SelfAttn + CPU fallback
-
-已有 active CUDA KV history
-→ fallback 不安全 → throw
+CUDA Attention fails
+→ 直接 CPU fallback
+→ CPU 没有历史 K/V
+→ 结果会悄悄错误
 ```
 
-这是一个非常重要的可靠性原则：
+所以当前 `SelfAttn::forward()` 会检查：
 
-> **“有 fallback 路径”不等于“任何时刻 fallback 都正确”。状态连续性优先。**
+```text
+无 active CUDA KV history
+→ 可以 disable CUDA self-attn 并 fallback CPU
 
----
+已有 active CUDA KV history
+→ fallback unsafe
+→ throw
+```
 
-## 48. Continuous CUDA Self-Attention 可单独关闭
+这是一个很重要的可靠性原则：
 
-`GptModel::start_continuous()` 读取：
+> **存在 fallback 代码，不等于任何时刻 fallback 都保持语义正确。状态连续性比“尽量继续跑”更重要。**
+
+Continuous 模式还可以通过：
 
 ```text
 EASY_LLM_DISABLE_CONTINUOUS_CUDA_SELF_ATTN
 ```
 
-它控制 Continuous 模式的 Self-Attention CUDA path。
-
-这不等于完全禁用所有 CUDA operator；其他 CUDA-capable ops 仍可能使用 GPU。
+提前禁用 Self-Attention CUDA path 做隔离测试。
 
 ---
 
-# 第十一部分：错误处理、可靠性，以及当前明确没有的能力
+# 第十部分：可靠性、错误处理和当前没有实现的能力
 
-## 49. 启动阶段尽量早发现错误
+## 44. 这个项目的可靠性重点是“尽早发现 silently wrong”
 
-当前代码大量校验：
+代码在很多边界做校验：
 
-- CLI ranges；
-- Safetensors header/dtype/shape/offset；
-- missing weight key；
-- model shape；
-- Tensor reshape/matmul；
-- sample ID；
-- cache shape；
-- valid length。
+```text
+CLI range
+Safetensors header/dtype/offset/shape
+missing model key
+model tensor shape
+sample_id range
+Tensor shape
+KV cache shape
+valid length
+```
 
-目标是让错误在边界处明确失败，而不是继续执行后生成悄悄错误的 token。
+对于 inference engine，很多错误不会 crash，而可能只是让生成结果变差。因此 shape、position、sample identity 之类的 invariant 特别重要。
 
 ---
 
-## 50. 当前没有 retry / idempotency / recovery / persistence
+## 45. 当前没有 Retry / Idempotency / Recovery / Persistence
 
 ### Retry
 
-失败请求不会自动重跑。
+模型/请求失败不会自动重跑。
 
 ### Idempotency
 
-`request_id` 只是进程内递增 ID，不是客户端 idempotency key。相同 Prompt 提交两次就是两个请求。
+`request_id` 只是进程内递增编号。相同 Prompt 提交两次就是两个请求。
 
 ### Recovery
 
-pending queue、active requests、generated IDs、KV cache 都在内存里。进程重启后无法继续未完成请求。
+pending queue、active requests、generated IDs、KV Cache 都在内存。进程重启无法继续。
 
 ### Persistence
 
 没有数据库或 durable queue。
 
-这些都是当前**未实现能力**，不是文档遗漏。
+这不是“教程漏讲”，而是当前 repo 明确没有这些能力。
 
 ---
 
-## 51. 当前没有 Authentication / Authorization
+## 46. 当前没有 Authentication / Authorization
 
-原因也很简单：`--serve` 没有网络入口和用户/tenant identity。
+因为当前没有网络 service boundary，也没有 user/tenant identity。
+
+如果未来增加 HTTP/gRPC，authn/authz 更适合放在 transport/service 层，而不是 `GptModel` 或 `SelfAttn`。
+
+---
+
+## 47. 内部逐 token Decode ≠ 对外 Token Streaming
+
+内部：
 
 ```text
-authentication = not implemented
-authorization  = not implemented
+each decode round → one token
 ```
 
-如果未来增加 HTTP/gRPC，这些更适合放在 transport/service boundary，而不是塞进 `GptModel` 或 `SelfAttn`。
-
----
-
-## 52. 当前不是 token streaming API
-
-内部确实每轮 Decode 一个 token，但 caller 看到的是 request 完成后：
-
-```cpp
-std::string text = tokenizer_.decode(request.generated_token_ids);
-std::cout << "[request " << request.request_id << "] " << text << "\n";
-```
-
-所以：
+对外：
 
 ```text
-incremental internal decode
-≠
-external token streaming
+request finishes
+→ tokenizer.decode(all generated IDs)
+→ stdout one final line
 ```
 
-当前没有 SSE/token callback channel。
+所以当前没有 SSE、token callback、stream handle。
 
 ---
 
-# 第十二部分：Tests 是可执行设计文档
+# 第十一部分：Tests 是可执行的架构说明
 
-## 53. `DataManager` invariant tests 在保护什么
+## 48. 为什么这些测试比“回答看起来正常”更重要
 
-`test/data_manager_invariants_test.cpp` 保护：
+自然语言输出有随机性，也很难精确判断内部是否正确。
 
-- BOS/tokenization 后真实长度；
-- left padding；
-- `seq_len` / `pad_len`；
-- PAD 不进入最终生成文本；
-- generated token 的记录时机。
+项目把关键 correctness 写成 invariants。
 
----
+### `data_manager_invariants_test.cpp`
 
-## 54. Generation invariants 在保护什么
+保护：
 
-`test/generation_invariants_test.cpp` 明确验证：
+```text
+真实 seq_len
+left padding
+pad_len
+输出 token 记录规则
+PAD 不进入生成结果
+```
+
+### `generation_invariants_test.cpp`
+
+保护：
 
 ```text
 Prefill offset = -pad_len
-Decode offset  = each sample's own pos_len
+Decode offset = each sample's pos_len
 只增加 active sample position
-EOS filter 后 sample_id/token 对应关系不乱
+EOS filter 后 sample_id/token 配对不乱
 ```
 
-这些 invariant 一旦错，程序往往不会立刻 crash，而是 silently wrong。
+### `cache_batching*_test.cpp`
 
----
-
-## 55. Cache batching tests 在保护什么
-
-`cache_batching_test.cpp` / `cache_batching_invariants_test.cpp`：
-
-- variable-length cache 正确拼 batch；
-- `valid_lens` 正确；
-- padded cache tail 被 mask；
-- heads/head_dim/sample_id 不合法时正确失败。
-
----
-
-## 56. Regression Gate
-
-CMake 给关键测试标记：
+保护：
 
 ```text
-invariant_gate
+variable-length KV cache 能正确拼 batch
+valid_lens 正确
+padded tail 被 mask
+非法 heads/head_dim/sample_id 正确失败
 ```
 
-运行：
+### CUDA tests
+
+覆盖 MatMul、MLP、Self-Attention、variable-length Attention 等 CUDA 路径。
+
+---
+
+## 49. Regression Gate
 
 ```bash
 cmake --build build --target easy_llm_regression_gates -j8
-```
-
-或者：
-
-```bash
 ctest --test-dir build --output-on-failure -L "^invariant_gate$"
 ```
 
-脚本：
+辅助脚本：
 
 ```bash
 bash scripts/run_regression_gates.sh
@@ -1701,15 +2099,15 @@ CUDA：
 bash scripts/run_regression_gates.sh --with-cuda
 ```
 
-测试策略最值得记住的是：
+最值得记住的是：
 
-> padding、position、stable sample identity、EOS shrink、cache valid length 这些状态 invariant，比“最终回答看起来差不多”更适合作为 inference engine 的回归门。
+> 对推理引擎来说，padding、position、stable sample identity、EOS shrink、cache valid length 等 invariant，比“最终生成一句话看起来差不多”更适合作为回归门。
 
 ---
 
-# 第十三部分：Build 与 Deployment Boundary
+# 第十二部分：Build、运行与 Deployment Boundary
 
-## 57. 推荐 CPU build
+## 50. 推荐先用 CPU 跑通
 
 ```bash
 cmake -S . -B build \
@@ -1719,8 +2117,6 @@ cmake -S . -B build \
 
 cmake --build build --target easy_llm -j8
 ```
-
-OpenMP 默认尝试开启；找不到时 CMake warning 后继续。
 
 模型文件：
 
@@ -1738,9 +2134,11 @@ data/model/
 ./build/easy_llm --greedy "Hello"
 ```
 
+第一次学习建议用 `--greedy`，先去掉随机 sampling 这一变量。
+
 ---
 
-## 58. CUDA build
+## 51. CUDA Build
 
 ```bash
 cmake -S . -B build \
@@ -1752,67 +2150,70 @@ cmake -S . -B build \
 cmake --build build --target easy_llm -j8
 ```
 
-### `build.sh` 的陷阱
+当前 `build.sh` 带机器相关参数，例如 CUDA architecture，因此通用环境优先使用显式 CMake command。
 
-当前 `build.sh` 写死：
+CPU-only 的本地实操记录另见：
 
 ```text
-EASY_LLM_ENABLE_CUDA=ON
-CMAKE_CUDA_ARCHITECTURES=120
+my/docs/build-test-run.zh-CN.md
 ```
-
-而 `CMakeLists.txt` 的 CUDA option 默认是 `OFF`。
-
-所以通用环境优先使用显式 CMake 命令；`build.sh` 更像机器相关实验脚本。
-
-CPU-only 的实操记录另见：`my/docs/build-test-run.zh-CN.md`。
 
 ---
 
-## 59. Local executable 和 production serving 之间的缺口
+## 52. Local executable 距离 production serving 还差什么
 
-当前可以作为长驻可执行程序运行，但完整 production serving 通常还需要它外层承担：
+当前 repo 的合理核心边界是：
+
+```text
+model loading
++ tokenizer
++ generation
++ in-process continuous batching
+```
+
+完整 production service 通常还需要外层承担：
 
 ```text
 network transport
-→ request validation
-→ authn/authz
-→ backpressure/admission policy
-→ timeout/cancellation
-→ streaming protocol
-→ metrics/tracing
-→ persistence/retry semantics（如果业务需要）
-→ model process
+request validation
+authn/authz
+backpressure
+cancellation / timeout
+streaming protocol
+metrics / tracing
+possibly persistence / retry
 ```
 
-这不意味着都应该塞进本 repo。更正确的边界是：
-
-> `easy_llm.cpp` 当前核心是 model loading + generation + in-process batching；transport/control-plane 是上层问题。
+这些不应该为了“功能齐全”全部塞进 `GptModel`。
 
 ---
 
-# 第十四部分：怎样继续扩展而不破坏边界
+# 第十三部分：怎样扩展而不破坏边界
 
-## 60. 支持新模型 family
+## 53. 支持新模型 family
 
-先逐项判断：
+逐项检查：
 
-1. config schema 是否兼容；
-2. checkpoint key 命名是否不同；
-3. Attention math 是否相同；
-4. MLP/Norm 是否相同；
-5. RoPE/position 规则是否相同；
-6. tokenizer 是否兼容；
-7. chat template 是否相同；
-8. BOS/EOS/PAD 规则是否相同。
+```text
+1. config schema
+2. checkpoint key naming
+3. Attention math
+4. head / KV-head layout
+5. MLP / activation
+6. Norm / epsilon
+7. RoPE / position rules
+8. Tokenizer
+9. Chat Template
+10. BOS/EOS/PAD
+```
 
-只有“权重 key 不同”时，扩展 `LayerKeyPrefix` 才足够。
+只有“权重 key 不同”时，扩展 `LayerKeyPrefix` 才够。
 
-如果数学结构不同，应增加真正的 model component，而不是在 `SelfAttn` 到处写模型名判断。
+如果数学结构不同，应增加真正的 model component，而不是在 `SelfAttn` 里到处写模型名分支。
 
 ---
 
-## 61. 增加 Sampling 策略
+## 54. 增加 Sampling 策略
 
 当前抽象：
 
@@ -1822,166 +2223,159 @@ Sampler
 └─ TopKTopPSampler
 ```
 
-新的 sampling policy 最自然地进入 `Sampler`，而不是改 Attention 或 DataManager。
+新的 sampling policy 最自然放在 `Sampler` 层。
 
-注意 RNG 当前属于 `GptModel`。如果未来要求 per-request seed，Continuous Batching 下需要重新设计 RNG state ownership。
+不要把 repetition penalty、beam search 等逻辑塞进 Attention。
+
+如果未来需要 per-request seed，需要同步设计 per-request RNG state，而不只是新增 CLI 参数。
 
 ---
 
-## 62. 增加 HTTP API 应该接在哪里
+## 55. 增加 HTTP API 最自然接在哪里
 
-更自然的方向：
+更合理：
 
 ```text
-HTTP/gRPC Adapter
-→ request lifecycle API
-→ ContinuousBatch scheduler
+HTTP Adapter
+→ submit/cancel/stream request API
+→ scheduler
 → GptModel
 ```
 
-而不是：
+真正要先设计的接口：
 
 ```text
-HTTP handler
-→ 直接操作 SelfAttn cache
+submit_prompt() 如何返回 handle/future
+如何 cancellation 并释放 slot/KV
+如何逐 token 上送
+request ID / idempotency key 谁定义
+timeout/retry 谁负责
 ```
 
-真正要先解决的接口问题包括：
-
-- `submit_prompt()` 如何返回 future/stream handle，而不是只 stdout；
-- cancellation 如何释放 slot/KV；
-- token streaming 如何从 decode round 上送；
-- request ID / idempotency key 谁定义；
-- timeout/retry 谁负责。
-
-这些都是现有边界自然暴露出的下一步。
+这些问题都来自现有 state ownership，而不是来自 HTTP 框架本身。
 
 ---
 
-# 第十五部分：Troubleshooting
+# 第十四部分：Troubleshooting——按数据流定位，不要随机猜
 
-## 63. 一启动就报模型结构错误
+## 56. 和 Hugging Face 输出不同：按这 5 层比较
 
-先看：
-
-```text
-data/model/config.json
-```
-
-再看：
+不要一上来怀疑 CUDA 或矩阵乘。
 
 ```text
-src/config.cpp
-src/models/model_param_validation.cpp
+1. exact templated text
+2. exact token IDs / BOS / special tokens
+3. greedy mode
+4. single-step logits
+5. multi-step KV / position
 ```
 
-如果前面已有 “Failed to open config” 日志，不要只追最后的 shape exception。
+当前 repo 与完整 HF runtime 已知可能存在：
+
+```text
+Tokenizer pre-tokenization 差异
+BOS policy 差异
+Chat template 能力差异
+Generation config 差异
+```
+
+只有前一层一致，才值得比较下一层。
 
 ---
 
-## 64. Missing weight / shape mismatch
+## 57. 输出异常短
 
-优先查：
+优先打印/确认：
 
 ```text
+Prompt after chat template
+token count
+--max-steps
+```
+
+因为：
+
+```text
+max_steps ≠ max_new_tokens
+```
+
+多 Prompt 固定 batch 还要注意 padded max width。
+
+---
+
+## 58. 短 Prompt 放入 batch 后结果不对
+
+沿这条链排查：
+
+```text
+DataManager::pad_len
+→ build_prefill_pos_offsets()
+→ SelfAttn::pad_lens_by_sample_
+→ KV valid_lens
+→ causal / padding / valid-length masks
+```
+
+优先跑 invariant tests，再看自然语言输出。
+
+---
+
+## 59. Missing weight / shape mismatch
+
+先查：
+
+```text
+config.json
 src/models/layer_key_prefix.cpp
 src/models/model_param_validation.cpp
 ```
 
 常见原因：
 
-- checkpoint 与 config 不是同一模型；
-- model family 不受支持；
-- key naming 不同；
-- hidden/head/kv-head dimensions 不一致。
+```text
+checkpoint/config 不属于同一模型
+model family 不支持
+weight key naming 不同
+hidden/head/KV-head dimensions 不匹配
+```
 
-不要一开始就钻进 CUDA kernel。
+不要先钻进 CUDA kernel。
 
 ---
 
-## 65. 输出异常短
+## 60. CUDA 报错后为什么不总是自动切 CPU
 
-先确认 templated Prompt 的 token length，再看：
+先区分：
 
 ```text
---max-steps
+stateless-ish operator failure
+vs
+stateful Self-Attention failure
 ```
 
-它不是纯 `max_new_tokens`。
-
-普通多 Prompt batch 还要注意最长 Prompt 决定 padded `input_seq_len`。
+如果 device KV history 已存在，CPU fallback 会失去历史状态，所以 fail fast 是正确保护。
 
 ---
 
-## 66. 短 Prompt 放进 batch 后结果不对
+# 第十五部分：推荐源码阅读顺序
 
-按这条链排查：
-
-```text
-DataManager::pad_len
-→ build_prefill_pos_offsets
-→ SelfAttn::pad_lens_by_sample_
-→ per-sample KV valid_lens
-→ causal / valid-length / padding masks
-```
-
-先跑对应 invariant tests，再比较最终自然语言。
-
----
-
-## 67. 和 Hugging Face 输出不同
-
-不要先怀疑矩阵乘。
-
-建议顺序：
-
-```text
-1. 比 exact input token IDs
-2. 比 BOS/special tokens
-3. 用 greedy 去掉 sampling 随机性
-4. 比 single-step logits
-5. 再看 multi-step KV/position
-```
-
-当前 Tokenizer pre-tokenization、BOS policy、chat template 和 generation config 都不是完整 Hugging Face runtime clone，因此 token IDs 不同是必须先排除的变量。
-
----
-
-## 68. CUDA 报错后为什么没有自动全切 CPU
-
-看失败发生在哪一层：
-
-- 普通 matmul/MLP 可以局部 fallback；
-- Self-Attention 如果已有 CUDA-only KV history，CPU fallback 会丢状态，所以直接失败是正确保护；
-- Continuous 模式可提前禁用 CUDA SelfAttn 做隔离测试。
-
----
-
-## 69. 没有 CUDA 的机器不要直接运行当前 `build.sh`
-
-CPU 环境直接：
-
-```bash
-cmake -S . -B build -DEASY_LLM_ENABLE_CUDA=OFF ...
-```
-
----
-
-# 第十六部分：推荐源码阅读顺序
-
-## 70. 第一遍：只看 Golden Path
+## 61. 第一遍：只追一条 Prompt
 
 ```text
 src/main.cpp
+→ src/cli_options.cpp
 → src/gpt_engine.cpp
 → src/data_manager.cpp
 → src/tokenizer.cpp
 → src/models/gpt_model.cpp
 ```
 
-目标：能复述一条 Prompt 如何进入模型并变成 output IDs。
+目标：能画出：
 
-## 71. 第二遍：看 Transformer 和状态
+```text
+text → IDs → tensor → logits → token ID → text
+```
+
+## 62. 第二遍：只追一个 Block 和 KV
 
 ```text
 src/models/block.cpp
@@ -1991,21 +2385,30 @@ src/models/block.cpp
 → src/models/generation_invariants.cpp
 ```
 
-目标：能解释 Prefill、Decode、RoPE offset、KV cache、EOS active-set shrink。
-
-## 72. 第三遍：看模型加载和底层 Tensor
+目标：能解释：
 
 ```text
-src/models/loader.cpp
+Q/K/V shapes
+RoPE offsets
+3 kinds of mask
+KV append
+stable sample identity
+```
+
+## 63. 第三遍：看模型怎样被装起来
+
+```text
+src/config.cpp
+→ src/models/loader.cpp
 → src/models/layer_key_prefix.cpp
 → src/models/model_param_validation.cpp
 → src/tensor.cpp
 → src/ops.cpp
 ```
 
-目标：知道 checkpoint 怎样变成模型对象，shape/precision 又怎样贯穿计算。
+目标：知道 checkpoint 到 C++ Tensor 的 ownership 和 shape validation。
 
-## 73. 第四遍：最后看 serving/CUDA
+## 64. 第四遍：最后看 Serving / CUDA
 
 ```text
 src/continuous_batch_server.cpp
@@ -2015,7 +2418,7 @@ src/continuous_batch_server.cpp
 → src/cuda/ops/self_attn_detail.cuh
 ```
 
-不要从 `self_attn_detail.cuh` 开始，否则会同时面对 Attention、CUDA、KV layout、batching 和 kernel optimization，学习曲线会叠在一起。
+不要从 `self_attn_detail.cuh` 开始。否则会同时面对 Attention、CUDA、KV layout、batching、kernel optimization 五层复杂度。
 
 ---
 
@@ -2028,19 +2431,45 @@ main
 └─ GptEngine::run
    ├─ DataManager::add_input
    ├─ DataManager::get_inputs
-   │  └─ Tokenizer / BPE
+   │  ├─ Tokenizer::tokenize
+   │  │  └─ Bpe::encode_into
+   │  └─ left padding
    ├─ GptModel::forward
    │  ├─ init_kv_cache
    │  ├─ prefill
-   │  │  └─ forward_logits
-   │  │     └─ Embedding → Blocks → Norm → tied projection
+   │  │  ├─ forward_logits
+   │  │  │  └─ Embedding → Blocks → Norm → tied projection
+   │  │  ├─ softmax
+   │  │  └─ sample
    │  ├─ decode loop
    │  ├─ EOS filter
    │  └─ reset_kv_cache
    └─ DataManager::log_outputs
+      └─ Tokenizer::decode
 ```
 
-## A.2 Continuous Batching
+## A.2 一个 `SelfAttn::forward_cpu`
+
+```text
+input [B,S,H]
+→ RMSNorm
+→ q/k/v projection
+→ split heads
+→ RoPE
+→ repeat KV heads for GQA
+→ append per-sample KV cache
+→ build padded active cache
+→ Q × K^T
+→ causal + valid-length + padding masks
+→ scale
+→ softmax
+→ Attention × V
+→ reshape
+→ o_proj
+→ output [B,S,H]
+```
+
+## A.3 Continuous Batching
 
 ```text
 input thread
@@ -2050,57 +2479,37 @@ input thread
 server loop
 ├─ admit_prefill_round
 │  ├─ pop pending
-│  ├─ tokenize / padding
+│  ├─ tokenize
 │  ├─ allocate slot
+│  ├─ left pad + position offsets
 │  └─ GptModel::sample_prefill_continuous
 ├─ decode_round
 │  └─ GptModel::sample_decode_continuous
 └─ finish_request
-   ├─ clear slot KV cache
+   ├─ clear slot KV
    ├─ return free slot
    └─ decode generated IDs → stdout
 ```
 
-## A.3 一个 Block
-
-```text
-Block::forward
-├─ SelfAttn::forward
-│  ├─ RMSNorm
-│  ├─ Q/K/V projections
-│  ├─ RoPE
-│  ├─ GQA repeat
-│  ├─ append/read KV cache
-│  ├─ masks + attention
-│  └─ O projection
-├─ residual add
-├─ MLP::forward
-│  ├─ RMSNorm
-│  ├─ up + gate
-│  ├─ SiLU(gate)
-│  ├─ multiply
-│  └─ down
-└─ residual add
-```
-
 ---
 
-# Appendix B：Documentation Drift / 实现边界
+# Appendix B：Documentation Drift / 容易误解的实现边界
 
-| 容易根据表面信息得到的结论 | 当前 executable code 的真实行为 |
+| 表面上容易得到的结论 | 当前 executable code 的真实行为 |
 |---|---|
 | `--max-steps` = 生成 N 个新 token | 更接近总 step/position ceiling；Prefill 已生成第一枚 token |
-| `--serve` = 网络 server | stdin/stdout long-lived Continuous Batching loop |
-| `tokenizer_config.json` 决定 chat template | special token/PAD 会读取，但 chat template 当前硬编码 |
-| 读取 HF tokenizer 文件 = HF tokenizer runtime parity | 当前普通 pre-tokenization/BOS policy 更简化，需要 parity test |
-| Loader 用 `mmap` = zero-copy model weights | 权重最终 copy/convert 进 owning `Tensor` |
-| `out_linear_` 成员 = runtime LM head | 当前 logits 走 embedding weight tying；该成员未进入 call path |
-| GQA 一定带来理论 KV cache 内存节省 | CPU path 先 repeat K/V heads，再保存当前 cache |
-| `rms_norm_eps` 自动来自 config | 当前 RMSNorm 直接使用 `1e-6` |
-| Temperature 会先改变 Top-P 候选边界 | 当前 Top-P 按原始 probability 的 `base_weight` 截断；temperature-adjusted `sample_weight` 只用于最终随机抽样 |
-| 支持 FP16/FP32/BF16 宏 = 三种 build 都是当前正式路径 | 标准 CMake 当前固定 `USE_BF16` |
-| CUDA failure 总能 CPU fallback | SelfAttn 已有 device KV history 后不允许不安全 fallback |
+| `--serve` = 网络 server | stdin/stdout long-lived batching loop |
+| `tokenizer_config.json` 决定 chat template | special token/PAD 会读取；chat template 当前硬编码 |
+| 读取 HF tokenizer files = HF runtime parity | 当前普通 pre-tokenization 与 BOS policy 更简化，需要 parity test |
+| Qwen 官方 `add_bos_token=false` 会自动被尊重 | 当前只看 `config.bos_token_id >= 0`，会主动 prepend BOS |
+| Loader 使用 `mmap` = runtime zero-copy weights | 权重最终 copy/convert 到 owning `Tensor` |
+| GQA 一定按理论比例节省 CPU KV cache | CPU path 先 repeat K/V heads，再 append cache |
+| `rms_norm_eps` 自动来自 config | 当前 `RMSNorm` 直接使用 `1e-6` |
+| Temperature 只影响最终随机抽样 | 当前先算 `p^(1/T)`，再 Top-K/Top-P；Top-P cutoff 可能因此改变 |
+| 支持多个 precision macro = 三种都是同等正式路径 | 当前标准 CMake 主要是 BF16 path |
+| CUDA failure 总能 CPU fallback | SelfAttn 已有 device KV history 后 fallback 不安全，会 throw |
 | Continuous Batching = 多模型线程并发 | 一个 scheduler/model loop 动态重组 active batch |
+| 内部每轮生成 token = 对外 streaming API | 当前只在 request 完成后 stdout 整段文本 |
 
 ---
 
@@ -2108,35 +2517,36 @@ Block::forward
 
 | 术语 | 本项目里的含义 |
 |---|---|
-| LLM inference | 使用训练好的模型权重，根据已有 token 自回归生成后续 token |
+| LLM inference | 用训练好的权重，根据已有 token 自回归预测后续 token |
 | Token | 模型处理文本的离散单位 |
 | Token ID | token 在 vocabulary 中的整数编号 |
-| BPE | Byte Pair Encoding，按 merge rank 合并文本/byte 片段的 tokenization 方法 |
+| BPE | Byte Pair Encoding，按 merge rank 合并 byte/token 片段 |
 | Embedding | token ID → hidden vector |
-| Logits | vocabulary 上的未归一化预测分数 |
+| Hidden State | Transformer 内部的向量表示 |
+| Logits | vocabulary 上未归一化的预测分数 |
 | Softmax | logits → probability distribution |
-| Prefill | 第一次处理完整 Prompt，并建立历史 KV cache |
+| Prefill | 第一次处理完整 Prompt，并建立历史 KV |
 | Decode | 后续每轮处理新 token，并复用历史 KV |
 | KV Cache | Attention 历史 Key/Value 状态 |
-| RoPE | Rotary Position Embedding，把 position 编进 Q/K |
+| RoPE | Rotary Position Embedding，把 position 作用到 Q/K |
 | GQA | Grouped Query Attention，多个 Query heads 共享较少 KV heads |
 | RMSNorm | Root Mean Square Normalization |
 | Residual | 子层输出与原输入相加 |
-| Top-K | 仅在最高的 K 个候选中采样 |
-| Top-P | 保留累计概率达到 P 的最小高概率集合 |
-| Continuous Batching | 请求持续到达时，每轮动态组合 active requests 共同 forward |
+| Top-K | 只保留最高权重的 K 个候选 |
+| Top-P | 保留累计权重达到 P 的最小高权重集合 |
+| Continuous Batching | 请求持续到达时动态组合 active requests 共同 forward |
 | `request_id` | 服务层请求身份 |
 | `sample_id` / `slot_id` | 稳定定位 per-request KV state 的身份 |
-| Invariant | 执行/重构过程中始终必须成立的正确性约束 |
+| Invariant | 执行过程中始终必须成立的正确性约束 |
 | Backend | 同一逻辑操作的 CPU/CUDA 具体实现 |
 
 ---
 
 # Appendix D：外部原始资料
 
-本文关于项目本身的事实以当前 repo executable code/config/tests 为准。需要继续学习背景时优先看原始资料：
+项目事实以当前 repo executable code/config/tests 为准。下面只用于核对模型与格式背景：
 
-- Qwen2.5-0.5B-Instruct：<https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct>
+- Qwen2.5-0.5B-Instruct model card：<https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct>
 - Qwen2.5 model config：<https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/config.json>
 - Qwen2.5 tokenizer config / chat template：<https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/tokenizer_config.json>
 - Qwen2.5 generation config：<https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/generation_config.json>
@@ -2148,16 +2558,45 @@ Block::forward
 
 ---
 
-## 最后重新用一句话描述项目
-
-> **`easy_llm.cpp` 用一套尽量直接、可追踪的 C++ 实现，把 Qwen2-family 模型从配置/权重加载、Tokenizer、Prefill、Transformer、KV cache、Sampling、Decode，一直做到基于稳定 cache slot 的 Continuous Batching；CPU 路径作为易验证 baseline，CUDA 作为可选 operator backend。**
-
-真正值得带走的三条关系是：
+## 最后重新用一条数据流描述项目
 
 ```text
-request lifecycle state ≠ model execution state
-current batch row ≠ stable cache identity
-available fallback ≠ correct fallback
+"Hello"
+→ Chat Template
+→ Token strings
+→ Token IDs [B,S]
+→ Embedding [B,S,H]
+→ 24 × Transformer Block
+→ Logits [B,S,V]
+→ Softmax
+→ Temperature / Top-K / Top-P
+→ Next Token ID
+→ KV Cache append
+→ Decode next round [B,1]
+→ ...
+→ Generated IDs
+→ Decoded text
 ```
 
-很多看似“多一层”的代码，正是在保护这三条边界。
+如果继续研究 serving，再在这条模型链外面加一层：
+
+```text
+Pending request
+→ stable slot
+→ Prefill admission
+→ dynamic active batch
+→ Decode rounds
+→ EOS / limit
+→ clear KV + return slot
+```
+
+真正值得带走的四条关系是：
+
+```text
+text protocol ≠ model tensor computation
+request lifecycle state ≠ model execution state
+current batch row ≠ stable cache identity
+available fallback ≠ semantically correct fallback
+```
+
+读懂这四条关系后，这个项目里的大多数“为什么要多一层”都会变得合理。
