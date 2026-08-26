@@ -121,32 +121,32 @@ flowchart TB
 sequenceDiagram
     participant U as Caller
     participant M as main
+    participant E as GptEngine
     participant D as DataManager
     participant G as GptModel
-    participant B as Blocks
-    participant P as Sampler
+    participant X as Blocks + Sampler
 
     U->>M: --greedy "Hello"
     M->>M: apply_chat_template()
-    M->>D: add_input()
+    M->>E: run(prompts)
+    E->>D: add_input() + get_inputs()
     D->>D: tokenize + left pad
-    M->>G: via GptEngine: forward(batch)
-    G->>B: Prefill whole prompt
-    B-->>G: logits [B,S,V]
-    G->>P: softmax + sample last position
-    P-->>G: first generated token
+    E->>G: forward(batch)
+    G->>X: Prefill whole prompt
+    X-->>G: first generated token
+    G->>D: add_output_token()
     loop Decode until EOS / limit
-        G->>B: one new token + old KV
-        B-->>G: logits [B,1,V]
-        G->>P: sample next token
+        G->>X: Decode one new token
+        X-->>G: next generated token
+        G->>D: add_output_token()
     end
-    G-->>D: record generated IDs
-    D-->>U: decode final text
+    E->>D: log_outputs()
+    D-->>U: decoded text
 ```
 
 **这张图最需要记住什么：**
 
-模型不是一次直接输出一句字符串。它第一次处理完整 Prompt 得到**第一枚新 token**，以后每轮只输入上一轮生成的 token，再预测下一枚；字符串只是所有 generated token IDs 最后 decode 出来的结果。
+单次模式的真实 orchestration 是 `main → GptEngine → DataManager / GptModel`。模型不是一次直接输出一句字符串：Prefill 产生第一枚新 token，之后 Decode 每轮再产生一枚；`GptModel` 在生成过程中把 token 记录进 `DataManager`，最后才统一 decode 成文本。
 
 ---
 
@@ -512,6 +512,30 @@ seed       = 42
 ```
 
 所以判断“实际启动参数”，不能只看 `Config` struct 的默认值。
+
+### 6.2 `GptEngine::run()`：Golden Path 在源码里其实很短
+
+`src/gpt_engine.cpp` 的核心调用链：
+
+```cpp
+for (const string& prompt : prompts) {
+    data_manager_->add_input(InputSample{prompt});
+}
+auto batch = data_manager_->get_inputs();
+model_->forward(batch);
+data_manager_->log_outputs(output_path);
+```
+
+调用关系很清楚：
+
+```text
+GptEngine
+├─ 调 DataManager：准备输入 batch
+├─ 调 GptModel：执行完整生成
+└─ 调 DataManager：decode / 输出结果
+```
+
+这也是 `GptEngine` 值得单独存在的原因：它负责 orchestration（编排），但不把 Tokenizer 算法、Transformer 数学或 KV Cache 实现混进来。
 
 ---
 
