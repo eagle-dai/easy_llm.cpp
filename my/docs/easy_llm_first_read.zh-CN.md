@@ -349,7 +349,48 @@ Prefill 负责把“已有历史”第一次算进去；Decode 以后每轮只�
 
 ---
 
-## 8. 把这个心智模型映射回 easy_llm.cpp
+## 8. 生成结束后，Token ID 怎样重新变回字符串
+
+模型每一轮选择的仍然是 token ID，例如：
+
+```text
+[t4, t5, t6, t7]
+```
+
+这些 generated token IDs 会先被累积保存。普通 CLI 路径里，`GptModel` 产生 token，`DataManager` 把生成的 token ID 记录到对应输出中。
+
+生成结束后才统一做：
+
+```text
+generated token IDs
+→ Tokenizer::decode(...)
+→ 最终字符串
+```
+
+所以整个闭环现在是：
+
+```text
+用户字符串
+→ Tokenizer
+→ Prompt token IDs
+→ 模型逐轮产生 generated token IDs
+→ Tokenizer::decode
+→ 输出字符串
+```
+
+这也解释了为什么“模型输出”在不同代码层里可能指不同东西：
+
+```text
+Transformer 层输出     = Tensor / logits
+Sampling 层输出        = next token ID
+DataManager 最终输出   = decoded text
+```
+
+不要把这三种“输出”混成同一个概念。
+
+---
+
+## 9. 把这个心智模型映射回 easy_llm.cpp
 
 第一次只看 5 个位置就够了。
 
@@ -374,7 +415,7 @@ DataManager
   文本怎样变成模型输入 batch？生成 token 保存在哪里？
 
 Tokenizer
-  字符串怎样变成 token / token ID？
+  字符串怎样变成 token / token ID？生成结束后怎样 decode 回字符串？
 
 GptModel
   Prefill、Decode、Softmax、Sampling 怎样串起来？
@@ -393,7 +434,7 @@ src/models/loader.cpp
 
 ---
 
-## 9. 第一次读正式教程时，哪些内容可以先跳过
+## 10. 第一次读正式教程时，哪些内容可以先跳过
 
 正式教程为了保持事实完整，会讲一些很重要、但不适合第一遍同时学习的内容。
 
@@ -421,13 +462,15 @@ text
 → next token
 → KV Cache
 → Decode 下一轮
+→ generated token IDs
+→ decoded text
 ```
 
 等这条线已经能自己讲出来，再回正式教程深入架构和实现细节。
 
 ---
 
-## 10. 读完本篇，检查自己是否真的理解
+## 11. 读完本篇，检查自己是否真的理解
 
 不看前文，试着回答：
 
@@ -437,7 +480,7 @@ text
 4. 为什么 LLM 生成一句话需要很多轮模型计算？
 5. KV Cache 解决了什么重复计算问题？
 6. Prefill 和 Decode 的输入长度为什么不同？
-7. 最终字符串是在什么时候重新出现的？
+7. generated token IDs 最后怎样变成用户看到的字符串？
 
 如果能用自己的话回答，再进入完整教程：
 
