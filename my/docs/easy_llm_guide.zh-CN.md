@@ -5,7 +5,7 @@
 > 本文按“读者需要依次理解什么”而不是按 repo 目录组织：先建立项目心智模型和真实 Golden Path，再逐步深入关键源码、状态所有权、Prefill/Decode、Attention/KV Cache、Continuous Batching、CPU/CUDA 边界、错误处理和测试。事实优先级为 executable code → configuration → tests → repository documentation；发生冲突时明确指出 documentation drift。代码片段只保留理解当前问题所需的最小部分。Mermaid 图必须与代码一致，并在图后说明“这张图最需要记住什么”。
 >
 > **核验日期：2026-08-26**  
-> **核验代码快照：`release@460f99efab5a31883adda373fbcc428991ca08b8`**
+> **核验代码快照：`release@5e715177299440848ea7a63077e4da7315cba0aa`**
 
 ---
 
@@ -1076,32 +1076,31 @@ clear_kv_cache(sample_id);
 logits: [batch, seq, vocab]
 ```
 
-`ops::softmax()` 先得到 float probabilities。
+`forward_logits()` 到这里结束；Prefill / Decode 的调用者随后执行 `ops::softmax()`，得到 float probabilities，再交给 Sampler。
 
-`TopKTopPSampler`：
+`TopKTopPSampler` 的当前实现要分成两条权重理解：
 
 ```text
 probabilities
-→ temperature adjustment
-→ sort descending
-→ Top-K
-→ Top-P
-→ random draw
+├─ base_weight = p
+│  └─ sort → Top-K → Top-P，决定候选集合
+└─ sample_weight = p^(1 / temperature)
+   └─ 只用于候选集合内的最终随机抽样
 ```
 
 `--greedy` 则直接选最大概率 token。
 
 ### Temperature 的真实实现
 
-当前代码在 softmax 后做：
+当前代码在 softmax 后计算：
 
 ```text
-p^(1 / temperature)
+sample_weight = p^(1 / temperature)
 ```
 
-而不是显式先 `logits / T` 再 softmax。
+在重新归一化后，这和常见的 `logits / T → softmax` 有相同的 temperature 变换数学含义；但**当前 Top-P 截断边界仍按原始 `base_weight` 计算**，temperature 不会改变候选集合，只会改变保留下来的候选之间的随机权重。
 
-所以讲实现时应按真实代码描述，不能因为别的框架常见写法就改写事实。
+因此不要把当前实现简写成“temperature → Top-P → sample”。做 Hugging Face 等框架的 sampling parity 时，这个执行语义差异必须单独核对。
 
 ---
 
@@ -2098,6 +2097,7 @@ Block::forward
 | `out_linear_` 成员 = runtime LM head | 当前 logits 走 embedding weight tying；该成员未进入 call path |
 | GQA 一定带来理论 KV cache 内存节省 | CPU path 先 repeat K/V heads，再保存当前 cache |
 | `rms_norm_eps` 自动来自 config | 当前 RMSNorm 直接使用 `1e-6` |
+| Temperature 会先改变 Top-P 候选边界 | 当前 Top-P 按原始 probability 的 `base_weight` 截断；temperature-adjusted `sample_weight` 只用于最终随机抽样 |
 | 支持 FP16/FP32/BF16 宏 = 三种 build 都是当前正式路径 | 标准 CMake 当前固定 `USE_BF16` |
 | CUDA failure 总能 CPU fallback | SelfAttn 已有 device KV history 后不允许不安全 fallback |
 | Continuous Batching = 多模型线程并发 | 一个 scheduler/model loop 动态重组 active batch |
@@ -2137,6 +2137,10 @@ Block::forward
 本文关于项目本身的事实以当前 repo executable code/config/tests 为准。需要继续学习背景时优先看原始资料：
 
 - Qwen2.5-0.5B-Instruct：<https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct>
+- Qwen2.5 model config：<https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/config.json>
+- Qwen2.5 tokenizer config / chat template：<https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/tokenizer_config.json>
+- Qwen2.5 generation config：<https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/generation_config.json>
+- Hugging Face Qwen2 tokenizer upstream：<https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2/tokenization_qwen2.py>
 - Safetensors upstream：<https://github.com/huggingface/safetensors>
 - Safetensors documentation：<https://huggingface.co/docs/safetensors/>
 - CMake documentation：<https://cmake.org/documentation/>
