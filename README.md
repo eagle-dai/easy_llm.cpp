@@ -6,6 +6,15 @@ A minimal C++ framework for learning and understanding the LLM inference pipelin
 
 This project focuses on **correctness and architecture clarity**, not peak serving performance. Third-party dependencies are intentionally minimal (`spdlog` and `nlohmann/json`, both vendored); the rest is implemented in C++ and kept friendly for coursework, research prototypes, and self-study.
 
+## Recommended Learning Path
+
+If LLM inference is new to you, do not start from the source tree or CUDA/Attention internals.
+
+1. Start with [**First Read: how one Prompt generates the next Token**](my/docs/easy_llm_first_read.zh-CN.md) to build the minimal `text → token IDs → Tensor → logits → next token → KV Cache → Decode` mental model.
+2. Continue with the [**source-code tutorial**](my/docs/easy_llm_guide.zh-CN.md), which maps Prefill/Decode, KV Cache, stable identity, padding/position, Continuous Batching, and CPU/CUDA state boundaries to the real implementation.
+3. For deeper implementation details, read the [**Deep Dive**](my/docs/easy_llm_deep_dive.zh-CN.md), covering Tokenizer/BPE, GQA, RoPE, Attention masks, precise sampling semantics, loading, reliability, troubleshooting, and extension boundaries.
+4. Then follow the source-reading route in the tutorials into the implementation and tests.
+
 ## Status (as of 2026-02-23)
 - `release` now includes a **continuous batching service mode** (`--serve`) in addition to one-shot CLI inference.
 - **Regression/invariant tests** were expanded, with CTest labels and a dedicated target `easy_llm_regression_gates`.
