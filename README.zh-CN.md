@@ -11,10 +11,11 @@
 如果第一次接触 LLM inference，不建议直接从目录或 Attention/CUDA 源码开始。
 
 1. 先读 [**第一次阅读：一条 Prompt 怎样生成下一个 Token**](my/docs/easy_llm_first_read.zh-CN.md)，只建立 `text → token IDs → Tensor → logits → next token → KV Cache → Decode` 的最小心智模型。
-2. 再读 [**教学式源码教程**](my/docs/easy_llm_guide.zh-CN.md)，沿 Golden Path 深入 Tokenizer、Transformer、KV Cache、Sampling、Continuous Batching、CPU/CUDA 和状态边界。
-3. 最后按教程末尾的源码阅读顺序进入具体实现和 tests。
+2. 再读 [**教学式源码教程**](my/docs/easy_llm_guide.zh-CN.md)，沿真实 Golden Path 把 Prefill/Decode、KV Cache、stable identity、padding/position、Continuous Batching 和 CPU/CUDA state boundary 映射到关键代码。
+3. 需要继续深入时，再读 [**深入实现版（Deep Dive）**](my/docs/easy_llm_deep_dive.zh-CN.md)，深入 Tokenizer/BPE、GQA、RoPE、三类 Attention mask、Sampling 精确语义、loader、可靠性、Troubleshooting 与扩展边界。
+4. 最后按教程末尾的源码阅读顺序进入具体实现和 tests。
 
-这样可以先理解“LLM 到底怎样逐 token 工作”，再理解项目为什么这样拆模块。
+这样可以先理解“LLM 到底怎样逐 token 工作”，再把核心机制钉到源码上，最后深入数学、实现细节和工程边界。
 
 ## 当前状态（截至 2026-02-23）
 - `release` 已支持 **连续批处理服务模式**（`--serve`），同时保留单次 CLI 推理。
